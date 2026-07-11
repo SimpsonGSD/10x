@@ -3283,7 +3283,7 @@ def HandleCommandlineModeKey(key: Key):
             clipboard_text = clipboard_value.strip()
             # Truncate if too big
             max_paste_length = 512 # characters
-            clipboard_text = clipboard_text[:max_paste_length-len(clipboard_text)]
+            clipboard_text = clipboard_text[:max_paste_length]
             # Insert clipboard at cursor pos
             g_Commandline.text = g_Commandline.text[:g_Commandline.cursorPos] + clipboard_text + g_Commandline.text[g_Commandline.cursorPos:]
             g_Commandline.cursorPos += len(clipboard_text)
