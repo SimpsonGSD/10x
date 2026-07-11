@@ -2099,10 +2099,12 @@ def HandleCommandModeChar(char):
         should_save = True
 
     elif c == "dgg":
+        N10X.Editor.PushUndoGroup()
         x, y = N10X.Editor.GetCursorPos()
         SetLineSelection(y, 0)
         N10X.Editor.ExecuteCommand("Cut")
         SetCursorPos(x, 0)
+        N10X.Editor.PopUndoGroup()
         should_save = True
 
     elif c == "dG":
