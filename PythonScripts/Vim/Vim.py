@@ -2785,7 +2785,7 @@ def HandleCommandModeChar(char):
     
     elif (m := re.match("ya([`'\"])", c)):
         action = m.group(1)
-        if pos := SelectAroundQuote(m.group(1), N10X.Editor.GetCursorPos()):
+        if pos := SelectAroundQuote(m.group(1)):
             N10X.Editor.ExecuteCommand("Copy")
             SetCursorPos(pos[0], pos[1])
 
