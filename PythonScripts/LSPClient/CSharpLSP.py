@@ -191,6 +191,10 @@ _client = LanguageServerClient(
     # Roslyn writes relative scratch dirs (a "{}" folder) into its cwd; launch
     # it under %TEMP% instead of the project root so it doesn't litter the tree.
     server_cwd=_roslyn_working_dir,
+    # Roslyn never PUSHes diagnostics (no textDocument/publishDiagnostics); it
+    # only answers PULL requests (textDocument/diagnostic). Opt in so errors and
+    # warnings actually show up, the way push-based servers (ols) do by default.
+    pull_diagnostics=True,
 )
 
 
