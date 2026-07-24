@@ -480,12 +480,18 @@ class LanguageServerClient:
                         (_COMMON_IGNORE_DIRS); keep language-specific entries
                         here in the per-language script rather than in this
                         module so new languages don't need to edit it.
+        server_cwd      Optional working directory for the server process.
+                        Default (None) launches it with cwd = project root.
+                        Pass a path, or a callable(root_path) -> path, to point
+                        it elsewhere - useful for servers that scribble relative
+                        scratch/log dirs (Roslyn writes a "{}" folder) into
+                        their cwd and would otherwise clutter the project root.
     """
 
     def __init__(self, name, language_id, extensions, default_command="",
                  fallback_argv=None, trigger_chars="", root_markers=None,
                  init_options=None, ignore_dirs=None, line_comment="",
-                 on_initialized=None):
+                 on_initialized=None, server_cwd=None):
         self.name = name
         self.language_id = language_id
         self.extensions = tuple(extensions)
@@ -496,8 +502,15 @@ class LanguageServerClient:
         self.root_markers = tuple(root_markers) if root_markers else _DEFAULT_ROOT_MARKERS
         self.init_options = init_options or {}
         self.on_initialized = on_initialized
-        # Directories the file-watch scan skips: the common set plus any the
-        # language script supplied.
+        # Working directory for the server process. By default the server is
+        # launched with cwd = project root, which is what most servers expect.
+        # Some servers (notably Roslyn) write scratch/log directories into their
+        # cwd, littering the project root; such a client can pass server_cwd to
+        # redirect those relative writes elsewhere (e.g. under %TEMP%). May be a
+        # path string, or a callable(root_path) -> path evaluated at launch (so
+        # it can derive a per-project temp dir). None keeps the current
+        # behaviour (cwd = root). See ensure_started.
+        self.server_cwd = server_cwd
         self.ignore_dirs = _COMMON_IGNORE_DIRS | frozenset(ignore_dirs or ())
         self.disabled = False
 
@@ -582,6 +595,28 @@ class LanguageServerClient:
         self.log(f"disabling, to restart execute {self.name}_Restart.")
         self.disabled = True
 
+    def _resolve_server_cwd(self):
+        """Working directory to launch the server in. Defaults to the project
+        root; server_cwd (a path or a callable(root_path) -> path) overrides it
+        so servers that write relative scratch/log dirs don't litter the root.
+        Falls back to the root if the override is empty or can't be created."""
+        target = self.server_cwd
+        if callable(target):
+            try:
+                target = target(self.root_path)
+            except Exception as e:
+                self.log(f"server_cwd callable failed ({e}); using project root")
+                target = None
+        if not target:
+            return self.root_path
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as e:
+            self.log(f"could not create working dir '{target}' ({e}); "
+                     f"using project root")
+            return self.root_path
+        return target
+
     def ensure_started(self, root_hint):
         if self.conn and self.conn.alive:
             return True
@@ -594,8 +629,9 @@ class LanguageServerClient:
         if not argv:
             self.log("no server command configured; set " + self.name + ".Command")
             return False
+        cwd = self._resolve_server_cwd()
         try:
-            self.conn = LSPConnection(argv, self.root_path,
+            self.conn = LSPConnection(argv, cwd,
                                       log=self.log, verbose=self._verbose)
         except FileNotFoundError:
             self.log(f"could not launch server: '{argv[0]}' not found. "
