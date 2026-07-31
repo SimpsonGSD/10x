@@ -94,6 +94,9 @@ the client you're configuring (`PythonLSP`, `RustLSP`, `OdinLSP`, `JaiLSP`,
 | `<name>.Diagnostics`        | `true` / `false`                | `true`             | Show the diagnostic under the cursor in the status bar and publish diagnostics to the build-output panel. |
 | `<name>.DiagnosticsLevel`   | `error` / `warning` / `info` / `hint` | `error`      | Lowest severity to show. `error` = errors only; `warning` = errors + warnings; `hint` = everything. Applies to the status bar and build output. |
 | `<name>.MaxResults`         | integer                         | `50`               | Max completion items to show, most-relevant first. Useful for servers like rust-analyzer that return the whole scope. |
+| `<name>.MaxFileSize`        | integer (KB)                    | `0` (unlimited)    | Skip files larger than this: they are never sent to the server, so neither side holds their text and language features are off for them. Aimed at huge generated files. |
+| `<name>.IgnoreDirs`         | comma/semicolon list            | *(none)*           | Extra directory **names** (matched at any depth) to skip in the workspace file-watch scan, on top of the built-in list. E.g. `Generated, ThirdParty`. |
+| `<name>.ServerEnv`          | `KEY=VALUE; KEY2=VALUE2`        | *(none)*           | Environment variables for the server process, merged over the editor's environment. Mainly for tuning servers that run on a VM - see [memory use](#memory-use). |
 | `<name>.LogVerbose`         | `true` / `false`                | `false`            | Log server traffic to the output panel. |
 
 ## Key bindings
@@ -120,6 +123,38 @@ panel, no keybinding needed - e.g. `RustLSP status`, `CSharpLSP diagnostics`,
 `symbols` is the only one that takes an argument - the term to search the project
 for, e.g. `RustLSP symbols Widget`. Without it the search uses the selected text
 or the word under the cursor.
+
+## Memory use
+
+Nearly all of the memory belongs to the **language server process**, not to this
+client. The server holds parsed syntax trees, compilations and symbol tables for
+everything it has been told to load, so the levers that matter are (in order):
+
+1. **Load less.** This is by far the biggest lever on a large repo. For C#, if
+   10x has a `.sln`/`.slnx` open as its workspace, Roslyn is pointed at exactly
+   that one automatically - no configuration needed. Otherwise the client opens
+   the first solution at the project root, or, failing that, *every* `.csproj`
+   under it, and Roslyn holds them all in memory. Set `CSharpLSP.Solution` to
+   avoid that fallback when your 10x workspace is a `.10x` file or a folder.
+2. **Tune the runtime.** Roslyn runs on .NET, so its footprint is largely GC
+   policy. `CSharpLSP.LowMemory: true` sets `DOTNET_GCConserveMemory=9` and
+   `DOTNET_gcServer=0` for the server process. Measured on a synthetic 400-file /
+   4800-method project: **peak working set 362 MB -> 183 MB (-49%)**, with no
+   measurable cost to project load time (7.1s both ways) or completion latency
+   (51 ms median both ways). The extra collection work scales with heap size, so
+   on a very large solution expect to trade some CPU for the saving. Use
+   `<name>.ServerEnv` to set other variables by hand.
+3. **Skip huge files.** `<name>.MaxFileSize` (in KB) stops oversized files being
+   sent at all. Both sides hold a copy of every open document, and on full-sync
+   servers the whole text is resent on each edit, so a few multi-MB generated
+   files cost more than they look. Skipped files get no language features, and
+   the output panel says which ones were skipped.
+
+`<name>.IgnoreDirs` only prunes *this client's* workspace file-watch scan (used
+for `workspace/didChangeWatchedFiles`); it does not stop the server from indexing
+those directories, so treat it as a CPU/IO saving rather than a memory one. Run
+`<Name>_Status()` to see the limits, extra ignores and server env currently in
+effect.
 
 ## Per-language setup
 
@@ -242,7 +277,15 @@ or the word under the cursor.
   `.csproj`. Unlike most servers, Roslyn does not auto-load a project on
   startup, so `CSharpLSP.py` sends the server the Roslyn-specific
   `solution/open` / `project/open` notification once it initializes - a solution
-  gives the best cross-project results.
+  gives the best cross-project results. What gets opened, in order: an explicit
+  `CSharpLSP.Solution`; the solution 10x itself has open (via
+  `GetWorkspaceFilename()`, which is skipped when the workspace is a `.10x` file
+  rather than a solution); the first `.sln`/`.slnx` at the project root; else
+  every `.csproj` found underneath.
+- **Memory:** Roslyn is the heaviest of the servers here. `CSharpLSP.Solution`
+  (load one solution/project instead of all of them) and `CSharpLSP.LowMemory:
+  true` (GC tuning, roughly halves peak working set) are the two levers - see
+  [memory use](#memory-use).
 - **Symbol search:** Roslyn needs a real search term - an empty
   `workspace/symbol` query returns nothing at all. Put the cursor on a word, or
   type `CSharpLSP symbols <text>` in the command panel.

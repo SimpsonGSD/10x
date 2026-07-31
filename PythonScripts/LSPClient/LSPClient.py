@@ -299,7 +299,7 @@ class LSPConnection:
     parsed messages is done by the owner on the main thread.
     """
 
-    def __init__(self, argv, cwd, log=None, verbose=None):
+    def __init__(self, argv, cwd, log=None, verbose=None, env=None):
         self._log = log or (lambda m: None)
         self._verbose = verbose or (lambda: False)
         self.incoming = queue.Queue()
@@ -307,8 +307,15 @@ class LSPConnection:
         self._next_id = 1
         self.alive = False
 
+        # env overrides are merged onto the editor's own environment rather than
+        # replacing it - the server still needs PATH, HOME, etc. to run.
+        proc_env = None
+        if env:
+            proc_env = dict(os.environ)
+            proc_env.update({str(k): str(v) for k, v in env.items()})
+
         self.proc = subprocess.Popen(
-            argv, cwd=cwd,
+            argv, cwd=cwd, env=proc_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             bufsize=0, creationflags=_NO_WINDOW)
         self.alive = True
@@ -501,7 +508,8 @@ class LanguageServerClient:
     def __init__(self, name, language_id, extensions, default_command="",
                  fallback_argv=None, trigger_chars="", root_markers=None,
                  init_options=None, ignore_dirs=None, line_comment="",
-                 on_initialized=None, server_cwd=None, pull_diagnostics=False):
+                 on_initialized=None, server_cwd=None, pull_diagnostics=False,
+                 server_env=None):
         self.name = name
         self.language_id = language_id
         self.extensions = tuple(extensions)
@@ -531,6 +539,9 @@ class LanguageServerClient:
         self._diag_pull_due = 0.0        # time.time() at which to flush the queue
         self._diag_pull_delay = 0.35     # debounce so we don't pull every keystroke
         self.ignore_dirs = _COMMON_IGNORE_DIRS | frozenset(ignore_dirs or ())
+        # Environment overrides for the server process: a dict, or a
+        # callable(client) -> dict evaluated at launch (so it can read settings).
+        self.server_env = server_env
         self.disabled = False
 
         self.conn = None
@@ -541,6 +552,7 @@ class LanguageServerClient:
         self._sync_kind = 1  # server textDocumentSync.change: 0 none/1 full/2 incremental
         self.pending = {}        # request id -> handler(result, error)
         self.docs = {}           # uri -> {"version", "text", "filename"}
+        self._skipped_docs = set()  # uris over MaxFileSize; never sent to server
         self.diagnostics = {}    # uri -> [Diagnostic]
         self._last_sync = 0.0
         self._sync_interval = 0.35
@@ -637,6 +649,41 @@ class LanguageServerClient:
             return self.root_path
         return target
 
+    def _resolve_server_env(self):
+        """Environment overrides for the server process. Merges the per-language
+        server_env (a dict, or a callable(client) -> dict so it can react to
+        settings) with the user's "<name>.ServerEnv" setting, which wins.
+
+        The setting is a semicolon- or comma-separated list of KEY=VALUE pairs:
+            CSharpLSP.ServerEnv: DOTNET_GCConserveMemory=9; DOTNET_gcServer=0
+        Mostly useful for memory/GC tuning of servers that run on a VM - see the
+        LowMemory notes in CSharpLSP.py."""
+        env = {}
+        src = self.server_env
+        if callable(src):
+            try:
+                src = src(self)
+            except Exception as e:
+                self.log(f"server_env callable failed ({e}); ignoring")
+                src = None
+        if src:
+            env.update(src)
+        raw = self.setting("ServerEnv").strip()
+        for pair in re.split(r"[;,]", raw):
+            pair = pair.strip()
+            if not pair:
+                continue
+            key, sep, value = pair.partition("=")
+            if not sep or not key.strip():
+                self.log(f"ignoring malformed {self.name}.ServerEnv entry '{pair}' "
+                         f"(expected KEY=VALUE)")
+                continue
+            env[key.strip()] = value.strip()
+        if env and self._verbose():
+            self.log("server env overrides: " +
+                     ", ".join(f"{k}={v}" for k, v in sorted(env.items())))
+        return env
+
     def ensure_started(self, root_hint):
         if self.conn and self.conn.alive:
             return True
@@ -650,9 +697,10 @@ class LanguageServerClient:
             self.log("no server command configured; set " + self.name + ".Command")
             return False
         cwd = self._resolve_server_cwd()
+        env = self._resolve_server_env()
         try:
-            self.conn = LSPConnection(argv, cwd,
-                                      log=self.log, verbose=self._verbose)
+            self.conn = LSPConnection(argv, cwd, log=self.log,
+                                      verbose=self._verbose, env=env)
         except FileNotFoundError:
             self.log(f"could not launch server: '{argv[0]}' not found. "
                      f"Install it or set {self.name}.Command.")
@@ -784,6 +832,7 @@ class LanguageServerClient:
         self.server_caps = {}
         self.pending.clear()
         self.docs.clear()
+        self._skipped_docs.clear()
         self.diagnostics.clear()
         self.disabled = False
         # Drop pull-diagnostics state with the connection; it re-arms on the
@@ -802,11 +851,37 @@ class LanguageServerClient:
     def _ready(self):
         return bool(self.conn and self.conn.alive and self.initialized)
 
+    def _max_file_bytes(self):
+        """"<name>.MaxFileSize" in KB, as bytes. 0/unset means no limit."""
+        try:
+            return max(0, int(self.setting("MaxFileSize", "0"))) * 1024
+        except (TypeError, ValueError):
+            return 0
+
+    def _too_big(self, filename, text):
+        """Whether this file is over the MaxFileSize limit. Oversized files are
+        never sent to the server: we hold their full text in self.docs and (on
+        full-sync servers) resend all of it on every edit, and the server then
+        parses and holds its own copy. Generated files - .designer.cs, huge
+        interop bindings - are the usual offenders."""
+        limit = self._max_file_bytes()
+        if not limit:
+            return False
+        size = len(text.encode("utf-8", "ignore")) if text else 0
+        if size <= limit:
+            return False
+        self.log(f"skipping {os.path.basename(filename)}: {size // 1024} KB "
+                 f"exceeds {self.name}.MaxFileSize ({limit // 1024} KB); "
+                 f"language features are off for this file")
+        return True
+
     def did_open(self, filename):
         if not self._ready():
             return
         uri = path_to_uri(filename)
         if uri in self.docs:
+            return
+        if uri in self._skipped_docs:
             return
         try:
             text = N10X.Editor.GetFileText(filename)
@@ -814,6 +889,10 @@ class LanguageServerClient:
             text = N10X.Editor.GetFileText()
         if text is None:
             text = ""
+        if self._too_big(filename, text):
+            # Remember it so we don't re-read and re-warn on every sync tick.
+            self._skipped_docs.add(uri)
+            return
         self.docs[uri] = {"version": 1, "text": text, "filename": filename}
         self.conn.notify("textDocument/didOpen", {
             "textDocument": {"uri": uri, "languageId": self.language_id,
@@ -878,6 +957,10 @@ class LanguageServerClient:
     def _doc_pos_params(self, pos=None):
         filename = N10X.Editor.GetCurrentFilename()
         if not self.handles(filename):
+            return None
+        # The server was never told about an oversized file, so asking it about a
+        # position in one would be answered against a document it doesn't have.
+        if path_to_uri(filename) in self._skipped_docs:
             return None
         x, y = N10X.Editor.GetCursorPos()
         if pos is not None:
@@ -990,6 +1073,19 @@ class LanguageServerClient:
                 self._watch_enabled = False
                 self._watch_mtimes = {}
 
+    def _all_ignore_dirs(self):
+        """Directory names the workspace scan skips: the built-in set plus
+        anything in "<name>.IgnoreDirs" (comma/semicolon separated), e.g.
+
+            CSharpLSP.IgnoreDirs: Generated, ThirdParty, TestData
+
+        Matching is on the directory NAME at any depth, not on a path."""
+        extra = self.setting("IgnoreDirs").strip()
+        if not extra:
+            return self.ignore_dirs
+        names = {p.strip() for p in re.split(r"[;,]", extra) if p.strip()}
+        return self.ignore_dirs | names
+
     def _snapshot_watched_files(self):
         """Map every workspace file we handle to its mtime. Cheap enough to run
         on a few-second cadence; heavy/irrelevant directories are skipped. Used
@@ -998,7 +1094,7 @@ class LanguageServerClient:
         root = self.root_path
         if not root or not os.path.isdir(root):
             return snap
-        ignore = self.ignore_dirs
+        ignore = self._all_ignore_dirs()
         for dirpath, dirnames, filenames in os.walk(root):
             # Prune noisy directories in place so os.walk never descends them.
             dirnames[:] = [d for d in dirnames if d not in ignore]
@@ -1690,6 +1786,15 @@ class LanguageServerClient:
         self.log(f"  current file    : {fn}")
         self.log(f"  handled         : {self.handles(fn)}")
         self.log(f"  open documents  : {len(self.docs)}")
+        limit = self._max_file_bytes()
+        self.log(f"  max file size   : "
+                 f"{str(limit // 1024) + ' KB' if limit else 'unlimited'}"
+                 f"{f' ({len(self._skipped_docs)} skipped)' if self._skipped_docs else ''}")
+        extra = sorted(self._all_ignore_dirs() - self.ignore_dirs)
+        self.log(f"  extra ignores   : {', '.join(extra) if extra else '(none)'}")
+        env = self._resolve_server_env()
+        self.log(f"  server env      : "
+                 f"{', '.join(f'{k}={v}' for k, v in sorted(env.items())) or '(none)'}")
 
     def hover(self, pos=None):
         params = self._doc_pos_params(pos)
@@ -1733,6 +1838,10 @@ class LanguageServerClient:
         symbol-references list (via textDocument/documentSymbol)."""
         filename = N10X.Editor.GetCurrentFilename()
         if not self.handles(filename):
+            return
+        if path_to_uri(filename) in self._skipped_docs:
+            N10X.Editor.SetStatusBarText(
+                f"{self.name}: file skipped (over {self.name}.MaxFileSize)")
             return
         self.sync_current(force=True)
         params = {"textDocument": {"uri": path_to_uri(filename)}}
