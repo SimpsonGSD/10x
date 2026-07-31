@@ -48,6 +48,16 @@ when their `Enabled` setting is `true`.
 - **Go to definition** - opens the target file at the definition (with a couple
   of retries for servers that answer `null` until the workspace finishes loading).
 - **Find references** - shown in 10x's symbol-references list.
+- **List functions** - the functions/methods in the current file
+  (`textDocument/documentSymbol`), shown in 10x's navigable symbol-references
+  list so you can jump straight to one.
+- **List symbols** - search the whole project's symbols (`workspace/symbol`),
+  shown in the same navigable list. This is a *search*, not a dump: LSP has no
+  "give me every symbol" request, and most servers return nothing for an empty
+  query. With no argument it searches for the selected text, falling back to the
+  word under the cursor; from the command panel you can pass one explicitly with
+  `<Name> symbols <text>`. Server support varies - see
+  [per-language setup](#per-language-setup).
 - **Diagnostics** - live errors/warnings from the server, surfaced two ways: the
   diagnostic under the cursor in the status bar, and all diagnostics rendered
   into the build-output panel as navigable MSVC-style lines. Filterable by
@@ -92,11 +102,24 @@ With `InterceptCommands` on (the default), 10x's standard bindings already drive
 the language server, so no setup is needed. To bind the per-language functions
 explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
 `<Name>_GotoDefinition()`, `<Name>_Hover()`, `<Name>_FindReferences()`,
-`<Name>_SignatureHelp()`, `<Name>_ToggleComment()`, `<Name>_CommentLine()`,
+`<Name>_ListFunctions()`, `<Name>_ListSymbols()`, `<Name>_SignatureHelp()`,
+`<Name>_ToggleComment()`, `<Name>_CommentLine()`,
 `<Name>_UncommentLine()`, `<Name>_ShowDiagnostics()`, `<Name>_Restart()` and
 `<Name>_Status()`. The comment commands map to 10x's defaults:
 `Control Shift /` (toggle), `Control K, Control C` (comment),
 `Control K, Control U` (uncomment).
+
+## Command panel
+
+Every feature can also be run by typing `<Name> <command>` into 10x's command
+panel, no keybinding needed - e.g. `RustLSP status`, `CSharpLSP diagnostics`,
+`PythonLSP restart`. Commands: `status`, `complete`, `hover`, `signature`,
+`definition`, `references`, `functions`, `symbols [text]`, `diagnostics`,
+`restart`, `comment`, `commentline`, `uncommentline`.
+
+`symbols` is the only one that takes an argument - the term to search the project
+for, e.g. `RustLSP symbols Widget`. Without it the search uses the selected text
+or the word under the cursor.
 
 ## Per-language setup
 
@@ -120,6 +143,11 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
   ```
   Install into the same Python that runs `pylsp`, then restart the server
   (`PythonLSP_Restart()`).
+- **No project-wide symbol search.** pylsp does not implement
+  `workspace/symbol` at all (it answers `Method Not Found`), so
+  `PythonLSP_ListSymbols()` reports that the server can't do it.
+  `PythonLSP_ListFunctions()` (current file) works fine. pyright does implement
+  it - see below.
 - **Alternative server:** pyright - `pip install pyright` and set
   `PythonLSP.Command: pyright-langserver --stdio`.
 
@@ -137,6 +165,11 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
 - **Project:** open a Cargo project (a folder with `Cargo.toml`); rust-analyzer
   discovers the workspace and dependencies from there. Non-Cargo projects need a
   `rust-project.json` at the root.
+- **Symbol search:** rust-analyzer searches *types only* by default. It reads two
+  suffixes on the query, which you can pass through the command panel: `#`
+  includes every symbol kind (functions, consts, ...) and `*` widens the search to
+  dependencies. So `RustLSP symbols parse#` finds functions named `parse`. An
+  empty query returns the workspace's types plus the crate roots.
 
 ### Odin (`OdinLSP.py`)
 
@@ -157,6 +190,10 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
     "enable_snippets": true
   }
   ```
+- **Symbol search:** OLS advertises `workspace/symbol` but returned no results at
+  all in testing (every query, including exact names, after a full index warm-up),
+  so `OdinLSP_ListSymbols()` will likely come up empty. There is no ols.json
+  option to change this. `OdinLSP_ListFunctions()` (current file) works.
 
 ### Jai (`JaiLSP.py`)
 
@@ -173,6 +210,9 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
   ```
   Without it, jails treats the opened file's folder as the workspace, which gives
   weaker cross-file results.
+- **Symbol search:** works with a search term (it matches struct members too, so
+  `Widget` also finds `Widget.size`). An empty query returns `null`, so put the
+  cursor on a word or type `JaiLSP symbols <text>`.
 
 ### C# (`CSharpLSP.py`)
 
@@ -203,6 +243,9 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
   startup, so `CSharpLSP.py` sends the server the Roslyn-specific
   `solution/open` / `project/open` notification once it initializes - a solution
   gives the best cross-project results.
+- **Symbol search:** Roslyn needs a real search term - an empty
+  `workspace/symbol` query returns nothing at all. Put the cursor on a word, or
+  type `CSharpLSP symbols <text>` in the command panel.
 - **Remove `.cs` from `ParserExtensions`.** 10x lists `.cs` there by default,
   which makes its built-in parser fight the language server; drop `.cs` from that
   setting (see the note under [Installation](#installation)). CSharpLSP logs a

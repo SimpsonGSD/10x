@@ -83,12 +83,19 @@
 #   F12:                 CSharpLSP_GotoDefinition()
 #   Control K:           CSharpLSP_Hover()
 #   Shift F12:           CSharpLSP_FindReferences()
+#   (no binding needed)  CSharpLSP_ListFunctions()    (functions in this file)
+#   (no binding needed)  CSharpLSP_ListSymbols()      (project-wide symbol search)
 #   Control Shift Space: CSharpLSP_SignatureHelp()
 #   Control Shift /:      CSharpLSP_ToggleComment()   (10x default)
 #   Control K, Control C: CSharpLSP_CommentLine()     (10x default)
 #   Control K, Control U: CSharpLSP_UncommentLine()   (10x default)
 #   (no binding needed)  CSharpLSP_ShowDiagnostics()
 #   (no binding needed)  CSharpLSP_Restart()
+#
+# NOTE - CSharpLSP_ListSymbols() searches the project for the selected text (or
+# the word under the cursor); type "CSharpLSP symbols <text>" in the command
+# panel to search for something else. Roslyn returns nothing for an empty query,
+# so it always needs a search term.
 # ---------------------------------------------------------------------------
 
 import os
@@ -218,6 +225,14 @@ def CSharpLSP_GotoDefinition():
 
 def CSharpLSP_FindReferences():
     _client.find_references()
+
+
+def CSharpLSP_ListSymbols():
+    _client.list_symbols()
+
+
+def CSharpLSP_ListFunctions():
+    _client.list_functions()
 
 
 def CSharpLSP_ShowDiagnostics():

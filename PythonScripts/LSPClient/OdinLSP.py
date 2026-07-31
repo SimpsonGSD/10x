@@ -66,6 +66,8 @@
 #   Control Shift /:      OdinLSP_ToggleComment()   (10x default)
 #   Control K, Control C: OdinLSP_CommentLine()     (10x default)
 #   Control K, Control U: OdinLSP_UncommentLine()   (10x default)
+#   (no binding needed)  OdinLSP_ListFunctions()   (functions in this file)
+#   (no binding needed)  OdinLSP_ListSymbols()     (project-wide symbol search)
 #   (no binding needed)  OdinLSP_ShowDiagnostics()
 #   (no binding needed)  OdinLSP_Restart()
 # ---------------------------------------------------------------------------
@@ -126,6 +128,14 @@ def OdinLSP_GotoDefinition():
 
 def OdinLSP_FindReferences():
     _client.find_references()
+
+
+def OdinLSP_ListSymbols():
+    _client.list_symbols()
+
+
+def OdinLSP_ListFunctions():
+    _client.list_functions()
 
 
 def OdinLSP_ShowDiagnostics():

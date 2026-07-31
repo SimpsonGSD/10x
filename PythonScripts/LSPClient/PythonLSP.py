@@ -67,8 +67,16 @@
 #   Control Shift /:      PythonLSP_ToggleComment()   (10x default)
 #   Control K, Control C: PythonLSP_CommentLine()     (10x default)
 #   Control K, Control U: PythonLSP_UncommentLine()   (10x default)
+#   (no binding needed)  PythonLSP_ListFunctions()   (functions in this file)
+#   (no binding needed)  PythonLSP_ListSymbols()     (project-wide symbol search)
 #   (no binding needed)  PythonLSP_ShowDiagnostics()
 #   (no binding needed)  PythonLSP_Restart()
+#
+# NOTE - pylsp does NOT implement workspace/symbol (it answers "Method Not
+# Found"), so PythonLSP_ListSymbols() reports that the server can't search the
+# project and does nothing else. PythonLSP_ListFunctions() (current file, via
+# textDocument/documentSymbol) works fine. pyright does support the project-wide
+# search - set PythonLSP.Command: pyright-langserver --stdio to use it.
 # ---------------------------------------------------------------------------
 
 import os
@@ -125,6 +133,14 @@ def PythonLSP_GotoDefinition():
 
 def PythonLSP_FindReferences():
     _client.find_references()
+
+
+def PythonLSP_ListSymbols():
+    _client.list_symbols()
+
+
+def PythonLSP_ListFunctions():
+    _client.list_functions()
 
 
 def PythonLSP_ShowDiagnostics():

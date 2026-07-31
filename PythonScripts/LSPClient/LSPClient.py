@@ -535,6 +535,7 @@ class LanguageServerClient:
 
         self.conn = None
         self.initialized = False
+        self.server_caps = {}    # capabilities from the initialize result
         self.root_uri = None
         self.root_path = None
         self._sync_kind = 1  # server textDocumentSync.change: 0 none/1 full/2 incremental
@@ -678,6 +679,7 @@ class LanguageServerClient:
                 "workspace": {
                     "configuration": True,
                     "workspaceFolders": True,
+                    "symbol": {"dynamicRegistration": False},
                     "didChangeConfiguration": {"dynamicRegistration": True},
                     # Let servers register file watchers with us. We don't watch
                     # the FS via the OS; instead, when a server registers we run
@@ -698,6 +700,12 @@ class LanguageServerClient:
                     "signatureHelp": {},
                     "definition": {"linkSupport": True},
                     "references": {},
+                    "documentSymbol": {
+                        # Accept the modern nested DocumentSymbol[] shape (we
+                        # flatten it) as well as the legacy flat
+                        # SymbolInformation[]; _on_document_symbols handles both.
+                        "hierarchicalDocumentSymbolSupport": True,
+                    },
                     "publishDiagnostics": {"relatedInformation": False},
                 },
             },
@@ -729,6 +737,10 @@ class LanguageServerClient:
         # Honour the server's document-sync mode. textDocumentSync may be a bare
         # number or an object with a "change" field: 0 none, 1 full, 2 incremental.
         caps = (result or {}).get("capabilities", {}) or {}
+        # Keep the whole capability set: some commands need to know up front
+        # whether the server implements a request at all (e.g. pylsp answers
+        # workspace/symbol with MethodNotFound - see list_symbols).
+        self.server_caps = caps
         sync = caps.get("textDocumentSync", 1)
         self._sync_kind = sync.get("change", 1) if isinstance(sync, dict) else sync
         if self._verbose():
@@ -769,6 +781,7 @@ class LanguageServerClient:
             self.conn.shutdown()
         self.conn = None
         self.initialized = False
+        self.server_caps = {}
         self.pending.clear()
         self.docs.clear()
         self.diagnostics.clear()
@@ -1489,20 +1502,133 @@ class LanguageServerClient:
             if length < 0:
                 length = 0
             items.append((path, line, index, length))
+        self._present_locations(items, "reference")
+
+    def _present_locations(self, items, noun):
+        """Hand a list of (path, line, index, length) tuples to 10x's navigable
+        symbol-references list. `noun` names them for status/log text (e.g.
+        "reference", "symbol"). Falls back to the output panel on older 10x."""
         if not items:
-            N10X.Editor.SetStatusBarText(f"{self.name}: no references found")
+            N10X.Editor.SetStatusBarText(f"{self.name}: no {noun}s found")
             return
         try:
             N10X.Editor.ShowSymbolReferences(items)
         except AttributeError:
             # Older 10x without ShowSymbolReferences: log to the output panel.
-            self.log(f"{len(items)} reference(s):")
+            self.log(f"{len(items)} {noun}(s):")
             for path, line, index, _ in items:
                 self.log(f"  {path}:{line + 1}:{index + 1}")
             N10X.Editor.SetStatusBarText(
-                f"{self.name}: {len(items)} reference(s) - see output panel")
+                f"{self.name}: {len(items)} {noun}(s) - see output panel")
         except Exception as e:
             self.log(f"ShowSymbolReferences failed: {e}")
+
+    # LSP SymbolKind values that are "functions" for list_symbols: Method (6),
+    # Constructor (9), Function (12). Other kinds (classes, fields, ...) are the
+    # symbols a function lives in, not functions themselves, so we skip them.
+    _FUNCTION_SYMBOL_KINDS = frozenset((6, 9, 12))
+
+    def _on_document_symbols(self, result, error, filename):
+        if error or not result:
+            N10X.Editor.SetStatusBarText(f"{self.name}: no symbols found")
+            return
+        # textDocument/documentSymbol returns either a nested DocumentSymbol[]
+        # (each with a "range"/"selectionRange" and possibly "children") or a
+        # flat SymbolInformation[] (each with a "location"). Flatten both to a
+        # single list of function-like symbols.
+        default_path = uri_to_path(path_to_uri(filename))
+        seen, items = set(), []
+
+        def add(kind, path, rng):
+            if kind not in self._FUNCTION_SYMBOL_KINDS or not rng:
+                return
+            start = rng.get("start", {})
+            line = start.get("line", 0)
+            index = start.get("character", 0)
+            key = (path, line, index)
+            if key in seen:
+                return
+            seen.add(key)
+            end = rng.get("end", {})
+            length = (end.get("character", index) - index
+                      if end.get("line", line) == line else 0)
+            items.append((path, line, index, max(length, 0)))
+
+        def walk(nodes):
+            for node in nodes:
+                if "location" in node:            # SymbolInformation
+                    loc = node.get("location", {})
+                    add(node.get("kind"), uri_to_path(loc.get("uri", "")),
+                        loc.get("range"))
+                else:                             # DocumentSymbol
+                    # selectionRange points at the name; nicer to land on than
+                    # the whole body range. Fall back to range if it's missing.
+                    add(node.get("kind"), default_path,
+                        node.get("selectionRange") or node.get("range"))
+                    walk(node.get("children") or [])
+
+        walk(result)
+        items.sort(key=lambda it: (it[0], it[1], it[2]))
+        self._present_locations(items, "function")
+
+    def _on_workspace_symbols(self, result, error, query=""):
+        if error:
+            # -32601 is MethodNotFound: the server doesn't implement
+            # workspace/symbol (pylsp, for one, despite answering
+            # textDocument/documentSymbol quite happily).
+            if (error or {}).get("code") == -32601:
+                self._no_workspace_symbols()
+            else:
+                self.log(f"workspace/symbol failed: {error}")
+                N10X.Editor.SetStatusBarText(
+                    f"{self.name}: symbol search failed - see output panel")
+            return
+        if not result:
+            # workspace/symbol is a search, not a dump. Servers differ on what an
+            # empty query means: rust-analyzer answers with the workspace's types,
+            # Roslyn returns nothing at all. Say which query came back empty so
+            # it's obvious a search term is needed.
+            if query:
+                N10X.Editor.SetStatusBarText(
+                    f"{self.name}: no symbols matching '{query}'")
+            else:
+                N10X.Editor.SetStatusBarText(
+                    f"{self.name}: this server needs a search term - put the "
+                    f"cursor on a word, or type '{self.name} symbols <text>'")
+            return
+        # workspace/symbol returns a flat SymbolInformation[] (or, in LSP 3.17,
+        # WorkspaceSymbol[]); both carry a "location". A WorkspaceSymbol may give
+        # only {"uri": ...} with no range (it expects a workspaceSymbol/resolve
+        # round-trip) - we just land at the top of that file in that case. Every
+        # symbol kind is listed here (this is the project-wide index), unlike
+        # list_functions which is functions only.
+        seen, items = set(), []
+        for sym in result:
+            loc = sym.get("location", {})
+            path = uri_to_path(loc.get("uri", ""))
+            if not path:
+                continue
+            rng = loc.get("range", {})
+            start = rng.get("start", {})
+            line = start.get("line", 0)
+            index = start.get("character", 0)
+            key = (path, line, index)
+            if key in seen:
+                continue
+            seen.add(key)
+            end = rng.get("end", {})
+            length = (end.get("character", index) - index
+                      if end.get("line", line) == line else 0)
+            items.append((path, line, index, max(length, 0)))
+        items.sort(key=lambda it: (it[0], it[1], it[2]))
+        self._present_locations(items, "symbol")
+
+    def _no_workspace_symbols(self):
+        """Tell the user this server can't do a project-wide symbol search."""
+        msg = (f"{self.name}: server has no project-wide symbol search "
+               f"(workspace/symbol) - use ListFunctions for the current file")
+        self.log(msg)
+        N10X.Editor.SetStatusBarText(msg)
 
     # -- public commands (wire these to keybindings) ----------------------
 
@@ -1551,6 +1677,15 @@ class LanguageServerClient:
         self.log(f"  server argv     : {self._server_argv()}")
         self.log(f"  connection      : {'alive' if (self.conn and self.conn.alive) else 'none/dead'}")
         self.log(f"  initialized     : {self.initialized}")
+        # Not every server implements every request; these two decide whether
+        # ListFunctions / ListSymbols can work at all (pylsp, for one, has no
+        # workspace/symbol).
+        self.log(f"  documentSymbol  : "
+                 f"{bool(self.server_caps.get('documentSymbolProvider'))} "
+                 f"(ListFunctions)")
+        self.log(f"  workspaceSymbol : "
+                 f"{bool(self.server_caps.get('workspaceSymbolProvider'))} "
+                 f"(ListSymbols)")
         self.log(f"  root            : {self.root_path}")
         self.log(f"  current file    : {fn}")
         self.log(f"  handled         : {self.handles(fn)}")
@@ -1592,6 +1727,76 @@ class LanguageServerClient:
         params["context"] = {"includeDeclaration": True}
         self.sync_current(force=True)
         self._send_request("textDocument/references", params, self._on_references)
+
+    def list_functions(self):
+        """List the functions/methods in the CURRENT file in 10x's navigable
+        symbol-references list (via textDocument/documentSymbol)."""
+        filename = N10X.Editor.GetCurrentFilename()
+        if not self.handles(filename):
+            return
+        self.sync_current(force=True)
+        params = {"textDocument": {"uri": path_to_uri(filename)}}
+        self._send_request(
+            "textDocument/documentSymbol", params,
+            lambda r, e: self._on_document_symbols(r, e, filename))
+
+    def list_symbols(self, query=None):
+        """Search symbols across the WHOLE project and show the matches in 10x's
+        navigable symbol-references list (via workspace/symbol).
+
+        Note this is a SEARCH, not an enumeration: LSP has no "give me every
+        symbol" request, and most servers return nothing for an empty query
+        (Roslyn does; rust-analyzer answers with the workspace's types). So with
+        no argument we search for the selected text, falling back to the word
+        under the cursor. Pass a string to search for something else - from the
+        command panel that's "<Name> symbols <text>"."""
+        if not self._ready():
+            self.log("server not ready")
+            return
+        # Some servers (pylsp) implement documentSymbol but not workspace/symbol.
+        # They say so at initialize; better to explain than to fire a request
+        # that comes back MethodNotFound.
+        if self.server_caps and not self.server_caps.get("workspaceSymbolProvider"):
+            self._no_workspace_symbols()
+            return
+        if query is None:
+            query = self._selected_text() or self._word_at_cursor()
+        query = (query or "").strip()
+        self._send_request("workspace/symbol", {"query": query},
+                           lambda r, e: self._on_workspace_symbols(r, e, query))
+
+    def _selected_text(self):
+        """The selected text when it's a single-line snippet we can search for,
+        else "". Used to seed the project-wide symbol search."""
+        try:
+            text = N10X.Editor.GetSelection() or ""
+        except Exception:
+            return ""
+        text = text.strip()
+        return "" if "\n" in text or "\r" in text else text
+
+    def _word_at_cursor(self):
+        """The whole identifier the cursor sits in or next to (unlike
+        _completion_word, which stops at the cursor). "" if there isn't one."""
+        try:
+            line = N10X.Editor.GetCurrentLine() or ""
+            x, _ = N10X.Editor.GetCursorPos()
+        except Exception:
+            return ""
+        if not line:
+            return ""
+        x = max(0, min(x, len(line)))
+
+        def is_word(c):
+            return c.isalnum() or c == "_"
+
+        start = x
+        while start > 0 and is_word(line[start - 1]):
+            start -= 1
+        end = x
+        while end < len(line) and is_word(line[end]):
+            end += 1
+        return line[start:end]
 
     # -- comment toggling --------------------------------------------------
     # Commenting is a purely editor-side text edit (LSP has no comment API), so
@@ -1888,6 +2093,10 @@ class LanguageServerClient:
             "gotodefinition": self.goto_definition,
             "references": self.find_references,
             "findreferences": self.find_references,
+            "symbols": self.list_symbols,
+            "listsymbols": self.list_symbols,
+            "functions": self.list_functions,
+            "listfunctions": self.list_functions,
             "diagnostics": self.show_all_diagnostics,
             "showdiagnostics": self.show_all_diagnostics,
             "restart": self.restart,
@@ -1901,11 +2110,11 @@ class LanguageServerClient:
         try:
             if not text:
                 return False
-            low = text.strip().lower()
+            raw = text.strip()
             prefix = self.name.lower()
-            if not low.startswith(prefix):
+            if not raw.lower().startswith(prefix):
                 return False
-            rest = low[len(prefix):]
+            rest = raw[len(prefix):]
             # Only handle the friendly "<name> <command>" form (space/colon/dash
             # separator). A bare "<Name>_<Func>" string is one of our exported
             # functions, which 10x executes directly from the command panel - if
@@ -1913,14 +2122,29 @@ class LanguageServerClient:
             # find-references output).
             if rest and rest[0] not in " :-":
                 return False
-            cmd = rest.lstrip(" :_-").replace(" ", "").replace("_", "")
-            fn = self._command_table().get(cmd)
-            if fn is None:
+            # Longest match wins, so multi-word commands ("list symbols") still
+            # resolve and anything left over is an argument: "<Name> symbols
+            # Widget" searches for "Widget". The argument keeps its original
+            # case - it's a search term, not a command name.
+            tokens = rest.lstrip(" :_-").split()
+            fn, arg = None, ""
+            for i in range(len(tokens), 0, -1):
+                fn = self._command_table().get(
+                    "".join(tokens[:i]).lower().replace("_", ""))
+                if fn is not None:
+                    arg = " ".join(tokens[i:])
+                    break
+            # Only the project-wide symbol search takes an argument; trailing
+            # text on anything else is a typo, not a command we know.
+            if fn is None or (arg and fn != self.list_symbols):
                 self.log(f"unknown command '{text}'. Try: {self.name} status | "
                          f"complete | hover | signature | definition | references | "
-                         f"diagnostics | restart")
+                         f"functions | symbols [text] | diagnostics | restart")
                 return True
-            fn()
+            if arg:
+                fn(arg)
+            else:
+                fn()
             return True
         except Exception as e:
             self.log(f"command panel error: {e}")
@@ -1942,6 +2166,8 @@ class LanguageServerClient:
             "autocomplete": self.complete,
             "showfunctionargsinfo": self.signature_help,
             "showsymbolinfo": self.hover,
+            "findfunction": self.list_functions,
+            "findsymbol": self.list_symbols,
         }
         # Comment commands only when commenting is enabled (a token is
         # configured and "<name>.Commenting" isn't off); otherwise leave 10x's
