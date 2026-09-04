@@ -44,7 +44,15 @@ when their `Enabled` setting is `true`.
   filtered to what you've typed and capped at `MaxResults`.
 - **Hover** - documentation for the symbol under the cursor, shown in 10x's
   inline hover box.
-- **Signature help** - the active function signature.
+- **Signature help ("function args info")** - shown in 10x's function-args box
+  (`ShowFunctionArgsListBox`) when you type a call's `(`, and left up until you
+  leave the parentheses. One overload per row, the active one last - 10x
+  highlights the bottom row, and you pick a different overload with the up/down
+  keys, so the list is put up once and left alone after that (it stays where it
+  opened rather than following the caret). Moving the cursor back between an
+  existing pair of parentheses does *not* bring it back: once dismissed it stays
+  dismissed, and `ShowFunctionArgsInfo` (Ctrl+Shift+Space) re-opens it at the
+  call's `(`. See the `SignatureHelp` setting.
 - **Go to definition** - opens the target file at the definition (with a couple
   of retries for servers that answer `null` until the workspace finishes loading).
 - **Find references** - shown in 10x's symbol-references list.
@@ -89,6 +97,7 @@ the client you're configuring (`PythonLSP`, `RustLSP`, `OdinLSP`, `JaiLSP`,
 | `<name>.Enabled`            | `true` / `false`                | `false`            | Opt-in master switch. The client is completely inert (no server launched, no hooks) until this is `true`. Takes effect on the next 10x restart. |
 | `<name>.Command`            | command line                    | *(per language)*   | Command used to launch the server, overriding the built-in default. E.g. `pylsp`, `rustup run stable rust-analyzer`, `C:/tools/ols.exe`. |
 | `<name>.AutoComplete`       | `true` / `false`                | `true`             | Auto-trigger completion as you type (after identifiers or trigger chars, debounced). Set `false` to use the keybinding only. |
+| `<name>.SignatureHelp`      | `true` / `false`                | `true`             | Open 10x's function-args box when you type a call's `(`. It is never re-opened by the cursor moving back between the parentheses - `ShowFunctionArgsInfo` does that on demand. Set `false` for on demand only. |
 | `<name>.InterceptCommands`  | `true` / `false`                | `true`             | Hook 10x's built-in commands so the default key bindings drive the language server for files this client handles. Set `false` to require the per-language `<Name>_*` functions instead. |
 | `<name>.Commenting`         | `true` / `false`                | `true`             | Handle `ToggleComment` / `CommentLine` / `UncommentLine` using the language's comment token. Set `false` to fall back to 10x's built-in commenting. Only applies when the language defines a token. |
 | `<name>.Diagnostics`        | `true` / `false`                | `true`             | Show the diagnostic under the cursor in the status bar and publish diagnostics to the build-output panel. |

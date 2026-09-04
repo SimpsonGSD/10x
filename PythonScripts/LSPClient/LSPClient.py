@@ -43,6 +43,11 @@
 #                           bindings drive the language server for files we
 #                           handle. Default true; set "false" to require the
 #                           per-language <Name>_* functions instead.
+#     <name>.SignatureHelp  "true"/"false" - put 10x's function-args box up when
+#                           you type a call's "(" (default true). It is never
+#                           re-opened by the cursor moving back between the
+#                           parentheses - ShowFunctionArgsInfo does that on
+#                           demand. Set "false" for on demand only.
 #     <name>.Commenting     "true"/"false" - handle 10x's ToggleComment /
 #                           CommentLine / UncommentLine for files we handle,
 #                           using the language's comment token (default true).
@@ -241,6 +246,48 @@ def strip_markdown_escapes(text):
         text = text[:-1]
     # "\<punct>" -> "<punct>".
     return _MD_ESCAPE.sub(r"\1", text)
+
+
+def _flatten(text):
+    """Collapse text to a single line: every run of whitespace (newlines and the
+    indentation servers use to wrap long signatures included) becomes one space."""
+    return " ".join((text or "").split())
+
+
+def _clean_signature_text(text):
+    """Run server-supplied signature/parameter text through the same cleanups the
+    hover box needs (fences, HTML entities, Markdown escapes)."""
+    return strip_markdown_escapes(strip_markup_html(strip_code_fences(text or "")))
+
+
+def signature_items(result, max_len=200, max_items=16):
+    """Render a textDocument/signatureHelp result as the rows of 10x's
+    function-args box (N10X.Editor.ShowFunctionArgsListBox): one overload per
+    row, the active one LAST, since 10x highlights the bottom row.
+
+        void Copy(byte[] src)
+        void Copy(byte[] src, int count)     <- active, highlighted by 10x
+
+    Rows are plain text, collapsed to a single line (server labels can span
+    lines) and capped at `max_len`. Returns [] when there is nothing worth
+    showing, so callers can leave the box alone rather than blank it."""
+    if not isinstance(result, dict):
+        return []
+    sigs = [s for s in (result.get("signatures") or []) if isinstance(s, dict)]
+    if not sigs:
+        return []
+    active = result.get("activeSignature")
+    if not isinstance(active, int) or not 0 <= active < len(sigs):
+        active = 0
+    # Active overload last - 10x highlights the bottom row. Truncation drops the
+    # other overloads from the top for the same reason: the active one stays.
+    order = [i for i in range(len(sigs)) if i != active] + [active]
+    rows = []
+    for i in order[-max_items:]:
+        row = _flatten(_clean_signature_text(sigs[i].get("label") or ""))
+        if row:
+            rows.append(row[:max_len])
+    return rows
 
 
 def first_location(result):
@@ -562,6 +609,17 @@ class LanguageServerClient:
         self._completion_inflight = False  # a completion request is awaiting reply
         self._completion_req_pos = None  # cursor (x, y) when that request was sent
         self._autocomplete_visible = False  # our completion popup is on screen
+        # Auto signature help ("function args info"). While the cursor sits
+        # inside a call's parentheses we keep 10x's function-args box filled with
+        # the signature for that call. See _refresh_signature_help.
+        self._sig_anchor = None      # (x, y) of the "(" of the call we're inside
+        self._sig_items = []         # rows last handed to the args box
+        self._sig_due = 0.0          # time.time() at which to (re-)request it
+        self._sig_dirty = False      # input happened; re-check on the next tick
+        self._sig_visible = False    # the args box is (believed) on screen
+        self._sig_tries = 0          # requests made for the current call
+        self._sig_typed_open = False # a "(" was typed since the last tick
+        self._sig_session = False    # this call's box is ours to fill
         self._last_cursor_pos = None     # (x, y) at the previous cursor-move event
         self._last_line_text = None      # current line text at that event (edit vs move)
         self._last_status_line = -1
@@ -745,7 +803,17 @@ class LanguageServerClient:
                                            "documentationFormat": ["plaintext", "markdown"]},
                     },
                     "hover": {"contentFormat": ["plaintext", "markdown"]},
-                    "signatureHelp": {},
+                    "signatureHelp": {
+                        # 10x's function-args box shows plain rows, so we only
+                        # ever render signature labels - no parameter detail is
+                        # asked for. contextSupport tells the server whether a
+                        # request came from a trigger char or is a re-trigger
+                        # while the same call is still being typed.
+                        "contextSupport": True,
+                        "signatureInformation": {
+                            "documentationFormat": ["plaintext", "markdown"],
+                        },
+                    },
                     "definition": {"linkSupport": True},
                     "references": {},
                     "documentSymbol": {
@@ -835,6 +903,8 @@ class LanguageServerClient:
         self._skipped_docs.clear()
         self.diagnostics.clear()
         self.disabled = False
+        # A signature on screen belongs to the server that answered for it.
+        self._hide_signature()
         # Drop pull-diagnostics state with the connection; it re-arms on the
         # next initialize.
         self._pull_active = False
@@ -1535,18 +1605,227 @@ class LanguageServerClient:
             return
         self._show_hover_box(text, pos)
 
-    def _on_signature(self, result, error, pos=None):
-        if error or not result or not result.get("signatures"):
-            N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+    # -- signature help ("function args info") -----------------------------
+    #
+    # 10x owns the box: ShowFunctionArgsListBox fills it with one row per
+    # overload, the user picks one with up/down, and an empty list takes it down.
+    # Two rules follow. The rows go up ONCE per call - re-pushing them resets the
+    # user's selection - and only when the user types the call's "(", so a box
+    # they dismissed stays dismissed until ShowFunctionArgsInfo.
+
+    def signature_help_enabled(self):
+        """On unless turned off, and only for a server that implements signature
+        help on a 10x build that has the function-args box."""
+        return (self.setting("SignatureHelp") != "false"
+                and bool(self.server_caps.get("signatureHelpProvider"))
+                and hasattr(N10X.Editor, "ShowFunctionArgsListBox"))
+
+    def _code_brackets(self, line):
+        """[(index, char), ...] for every bracket and ";" in `line` that isn't
+        inside a string literal or a line comment - i.e. the ones that actually
+        nest code, so "f(\"a)b\")" isn't read as an unbalanced call.
+
+        Quote handling is deliberately minimal: a single quote only opens a
+        literal when the same line closes it, so Rust lifetimes ("&'a T") and
+        stray apostrophes in comments don't swallow the rest of the line."""
+        out = []
+        i, n, quote = 0, len(line), ""
+        while i < n:
+            c = line[i]
+            if quote:
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == quote:
+                    quote = ""
+            elif c == '"' or (c == "'" and "'" in line[i + 1:]):
+                quote = c
+            elif self.line_comment and line.startswith(self.line_comment, i):
+                break  # rest of the line is a comment
+            elif c in "()[]{};":
+                out.append((i, c))
+            i += 1
+        return out
+
+    def _enclosing_call_paren(self, max_lines=24):
+        """(x, y) of the "(" of the innermost call the cursor is inside, else
+        None. This is what decides whether the args box should be up at all, and
+        - because it identifies the specific call - when to throw away a
+        signature because the user moved into a different one.
+
+        Scans backwards from the cursor, bracket-matching as it goes. Balanced
+        [...] and {...} are transparent (an argument can be a list or an object
+        literal). An unmatched "[" is transparent too - the cursor is inside a
+        list that is itself an argument - but an unmatched "{" is a block (or a
+        statement-level literal) and an unmatched ";" ends the statement, so in
+        both cases there is no enclosing call to describe."""
+        try:
+            x, y = N10X.Editor.GetCursorPos()
+        except Exception:
+            return None
+        depth = {")": 0, "]": 0, "}": 0}
+        for ln in range(y, max(-1, y - max_lines), -1):
+            try:
+                text, _ = self._split_eol(N10X.Editor.GetLine(ln) or "")
+            except Exception:
+                return None
+            if ln == y:
+                text = text[:x]
+            for i, c in reversed(self._code_brackets(text)):
+                if c in depth:
+                    depth[c] += 1
+                elif c == "(":
+                    if depth[")"] == 0:
+                        return (i, ln)
+                    depth[")"] -= 1
+                elif c == "[":
+                    if depth["]"]:
+                        depth["]"] -= 1
+                elif c == "{":
+                    if not depth["}"]:
+                        return None
+                    depth["}"] -= 1
+                elif c == ";" and not depth[")"]:
+                    return None
+        return None
+
+    def _show_signature(self):
+        """Open 10x's function-args box, once per call.
+
+        The position is the caret as it is when a call is opened - just after the
+        "(" - which is what 10x binds the box to and tracks the arguments from.
+        ShowFunctionArgsInfo mid-call passes the same place, so the box always
+        appears at the start of the argument list."""
+        if not self._sig_items:
             return
-        sigs = result["signatures"]
-        active = result.get("activeSignature", 0) or 0
-        sig = sigs[active] if active < len(sigs) else sigs[0]
-        label = sig.get("label", "")
-        if not label.strip():
-            N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+        if self._sig_anchor is not None:
+            pos = (self._sig_anchor[0] + 1, self._sig_anchor[1])
+        else:
+            try:
+                pos = N10X.Editor.GetCursorPos()
+            except Exception:
+                pos = None
+        if self._verbose():
+            self.log(f"args box at {pos}: {len(self._sig_items)} row(s); "
+                     f"{self._sig_items[0]!r}")
+        try:
+            if pos is None:
+                N10X.Editor.ShowFunctionArgsListBox(self._sig_items)
+            else:
+                N10X.Editor.ShowFunctionArgsListBox(self._sig_items, pos)
+            self._sig_visible = True
+        except AttributeError:
+            # Older 10x without the function-args box: fall back to a one-shot
+            # hover box, which the next key press dismisses.
+            self._show_hover_box("\n".join(self._sig_items), None)
+        except Exception as e:
+            self.log(f"ShowFunctionArgsListBox failed: {e}")
+
+    def _clear_args_box(self):
+        """Take the args box off screen. An empty list dismisses it, as it does
+        the autocomplete one."""
+        if not self._sig_visible:
             return
-        self._show_hover_box(label, pos)
+        self._sig_visible = False
+        try:
+            N10X.Editor.ShowFunctionArgsListBox([])
+        except Exception:
+            pass
+
+    def _hide_signature(self):
+        """End the session: there is no call under the cursor to describe."""
+        self._sig_anchor = None
+        self._sig_items = []
+        self._sig_due = 0.0
+        self._sig_tries = 0
+        self._sig_session = False
+        self._clear_args_box()
+
+    def _refresh_signature_help(self, now):
+        """Re-evaluate the args box after an input event: end the session when the
+        cursor leaves the call, start one when the user types a call's "(", and
+        otherwise leave the box alone."""
+        opened, self._sig_typed_open = self._sig_typed_open, False
+        if not self._ready():
+            self._hide_signature()
+            return
+        try:
+            if not self.handles(N10X.Editor.GetCurrentFilename()):
+                self._hide_signature()
+                return
+        except Exception:
+            return
+        anchor = self._enclosing_call_paren()
+        if anchor is None:
+            self._hide_signature()
+            return
+        if not self.signature_help_enabled():
+            # Auto-open off: a box from ShowFunctionArgsInfo stays until the
+            # cursor leaves that call.
+            if anchor != self._sig_anchor:
+                self._hide_signature()
+            return
+        if anchor != self._sig_anchor:
+            # A different call: take the old rows down so a signature is never
+            # left up against the wrong arguments.
+            self._sig_anchor = anchor
+            self._sig_items = []
+            self._sig_session = False
+            self._clear_args_box()
+        if opened and not self._sig_session:
+            # The user just typed this call's "(". Tested outside the branch
+            # above because the cursor-move event for the same keystroke can land
+            # first, updating the anchor before this flag is seen.
+            self._sig_session = True
+            self._sig_tries = 0
+            self._sig_due = now
+        elif (self._sig_session and not self._sig_items
+                and self._sig_tries < 3):
+            # Our call, nothing to show yet (server still loading, or the line
+            # didn't parse). Retry as the user types, but only a few times so an
+            # "if (x" doesn't ask forever.
+            due = now + self._auto_delay
+            if not self._sig_due or due < self._sig_due:
+                self._sig_due = due
+
+    def _request_signature_help(self, manual=False):
+        params = self._doc_pos_params()
+        if params is None:
+            if manual:
+                N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+            return
+        # We advertise contextSupport, so say why we're asking: an automatic
+        # request always follows a typed "(".
+        if manual:
+            context = {"triggerKind": 1,          # Invoked
+                       "isRetrigger": bool(self._sig_items)}
+        else:
+            context = {"triggerKind": 2,          # TriggerCharacter
+                       "triggerCharacter": "(",
+                       "isRetrigger": self._sig_tries > 0}
+            self._sig_tries += 1
+        params["context"] = context
+        self.sync_current(force=True)
+        anchor = self._sig_anchor
+        self._send_request("textDocument/signatureHelp", params,
+                           lambda r, e: self._on_signature(r, e, anchor, manual))
+
+    def _on_signature(self, result, error, anchor=None, manual=True):
+        # The cursor can move to another call while the server answers; a reply
+        # that no longer describes the call we're in is dropped.
+        if not manual and anchor != self._sig_anchor:
+            return
+        items = [] if error else signature_items(result)
+        if not manual and items == self._sig_items and self._sig_visible:
+            return  # 10x is already showing this list - leave the user's choice
+        if not items:
+            if manual:
+                N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+            # Otherwise leave the box alone: a null answer mid-edit shouldn't
+            # blank what the user is reading.
+            return
+        self._sig_items = items
+        self._show_signature()
 
     def _on_definition(self, result, error, retry=0):
         loc = first_location(result)
@@ -1809,13 +2088,15 @@ class LanguageServerClient:
                            lambda r, e: self._on_hover(r, e, pos))
 
     def signature_help(self):
-        params = self._doc_pos_params()
-        if params is None:
-            return
-        self.sync_current(force=True)
-        pos = N10X.Editor.GetCursorPos()
-        self._send_request("textDocument/signatureHelp", params,
-                           lambda r, e: self._on_signature(r, e, pos))
+        """ShowFunctionArgsInfo / the "signature" command: put the overloads for
+        the call under the cursor up now, at that call's opening "(". The only
+        way back once the box has been dismissed."""
+        self._sig_anchor = self._enclosing_call_paren()
+        self._sig_items = []
+        self._sig_due = 0.0
+        self._sig_tries = 0
+        self._sig_session = True
+        self._request_signature_help(manual=True)
 
     def goto_definition(self, _retry=0):
         params = self._doc_pos_params()
@@ -2029,19 +2310,28 @@ class LanguageServerClient:
             self.log(f"on_post_save error: {e}")
 
     def _on_char_key(self, ch=None, *args):
-        # As-you-type completion: schedule a (debounced) completion request when
-        # an identifier char or a trigger char is typed. Each keystroke pushes
-        # the due time forward, so a burst of typing fires a single request once
-        # the user pauses for _auto_delay seconds.
-        if not ch or self.setting("AutoComplete") == "false":
+        # A typed character can open or close a call, so re-check the args box on
+        # the next tick, by which point the character is in the buffer.
+        self._sig_dirty = True
+        if not ch:
             return
-        # Only schedule completion when the focused file is one we handle;
-        # otherwise typing in another language's file (e.g. after switching
-        # workspaces) would queue requests that just get rejected.
+        # Only act when the focused file is one we handle; otherwise typing in
+        # another language's file (e.g. after switching workspaces) would queue
+        # requests that just get rejected.
         try:
             if not self.handles(N10X.Editor.GetCurrentFilename()):
                 return
         except Exception:
+            return
+        # A typed "(" is the one thing that opens the args box by itself;
+        # _refresh_signature_help consumes this on the next tick.
+        if ch == "(":
+            self._sig_typed_open = True
+        # As-you-type completion: schedule a (debounced) completion request when
+        # an identifier char or a trigger char is typed. Each keystroke pushes
+        # the due time forward, so a burst of typing fires a single request once
+        # the user pauses for _auto_delay seconds.
+        if self.setting("AutoComplete") == "false":
             return
         if ch in self.trigger_chars or ch.isalnum() or ch == "_":
             self._completion_due = time.time() + self._auto_delay
@@ -2065,6 +2355,11 @@ class LanguageServerClient:
             prev_line = self._last_line_text
             self._last_cursor_pos = cur
             self._last_line_text = line
+            # Any caret movement can take us into or out of a call's parentheses
+            # (and non-char keys such as backspace/arrows only surface here), so
+            # re-evaluate the args box on the next tick.
+            if cur != prev:
+                self._sig_dirty = True
             # Keep the popup tied to the word being edited; react to how the
             # cursor moved (only while something completion-related is live). The
             # key distinction is an *edit* (the line's text changed) versus a pure
@@ -2119,6 +2414,14 @@ class LanguageServerClient:
             # Fire any debounced diagnostic pulls (pull-diagnostics clients only).
             if self._ready():
                 self._flush_diag_pulls(now)
+            # Re-check the args box once per input event, before the completion
+            # branch below - that one returns early.
+            if self._sig_dirty:
+                self._sig_dirty = False
+                self._refresh_signature_help(now)
+            if self._ready() and self._sig_due and now >= self._sig_due:
+                self._sig_due = 0.0
+                self._request_signature_help()
             # Completion fires as soon as it's due (not throttled).
             if (self._ready() and self._completion_due
                     and now >= self._completion_due):
