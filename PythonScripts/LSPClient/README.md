@@ -44,10 +44,28 @@ when their `Enabled` setting is `true`.
   filtered to what you've typed and capped at `MaxResults`.
 - **Hover** - documentation for the symbol under the cursor, shown in 10x's
   inline hover box.
-- **Signature help** - the active function signature.
+- **Signature help ("function args info")** - shown in 10x's function-args box
+  (`ShowFunctionArgsListBox`) when you type a call's `(`, and left up until you
+  leave the parentheses. One overload per row, the active one last - 10x
+  highlights the bottom row, and you pick a different overload with the up/down
+  keys, so the list is put up once and left alone after that (it stays where it
+  opened rather than following the caret). Moving the cursor back between an
+  existing pair of parentheses does *not* bring it back: once dismissed it stays
+  dismissed, and `ShowFunctionArgsInfo` (Ctrl+Shift+Space) re-opens it at the
+  call's `(`. See the `SignatureHelp` setting.
 - **Go to definition** - opens the target file at the definition (with a couple
   of retries for servers that answer `null` until the workspace finishes loading).
 - **Find references** - shown in 10x's symbol-references list.
+- **List functions** - the functions/methods in the current file
+  (`textDocument/documentSymbol`), shown in 10x's navigable symbol-references
+  list so you can jump straight to one.
+- **List symbols** - search the whole project's symbols (`workspace/symbol`),
+  shown in the same navigable list. This is a *search*, not a dump: LSP has no
+  "give me every symbol" request, and most servers return nothing for an empty
+  query. With no argument it searches for the selected text, falling back to the
+  word under the cursor; from the command panel you can pass one explicitly with
+  `<Name> symbols <text>`. Server support varies - see
+  [per-language setup](#per-language-setup).
 - **Diagnostics** - live errors/warnings from the server, surfaced two ways: the
   diagnostic under the cursor in the status bar, and all diagnostics rendered
   into the build-output panel as navigable MSVC-style lines. Filterable by
@@ -79,11 +97,15 @@ the client you're configuring (`PythonLSP`, `RustLSP`, `OdinLSP`, `JaiLSP`,
 | `<name>.Enabled`            | `true` / `false`                | `false`            | Opt-in master switch. The client is completely inert (no server launched, no hooks) until this is `true`. Takes effect on the next 10x restart. |
 | `<name>.Command`            | command line                    | *(per language)*   | Command used to launch the server, overriding the built-in default. E.g. `pylsp`, `rustup run stable rust-analyzer`, `C:/tools/ols.exe`. |
 | `<name>.AutoComplete`       | `true` / `false`                | `true`             | Auto-trigger completion as you type (after identifiers or trigger chars, debounced). Set `false` to use the keybinding only. |
+| `<name>.SignatureHelp`      | `true` / `false`                | `true`             | Open 10x's function-args box when you type a call's `(`. It is never re-opened by the cursor moving back between the parentheses - `ShowFunctionArgsInfo` does that on demand. Set `false` for on demand only. |
 | `<name>.InterceptCommands`  | `true` / `false`                | `true`             | Hook 10x's built-in commands so the default key bindings drive the language server for files this client handles. Set `false` to require the per-language `<Name>_*` functions instead. |
 | `<name>.Commenting`         | `true` / `false`                | `true`             | Handle `ToggleComment` / `CommentLine` / `UncommentLine` using the language's comment token. Set `false` to fall back to 10x's built-in commenting. Only applies when the language defines a token. |
 | `<name>.Diagnostics`        | `true` / `false`                | `true`             | Show the diagnostic under the cursor in the status bar and publish diagnostics to the build-output panel. |
 | `<name>.DiagnosticsLevel`   | `error` / `warning` / `info` / `hint` | `error`      | Lowest severity to show. `error` = errors only; `warning` = errors + warnings; `hint` = everything. Applies to the status bar and build output. |
 | `<name>.MaxResults`         | integer                         | `50`               | Max completion items to show, most-relevant first. Useful for servers like rust-analyzer that return the whole scope. |
+| `<name>.MaxFileSize`        | integer (KB)                    | `0` (unlimited)    | Skip files larger than this: they are never sent to the server, so neither side holds their text and language features are off for them. Aimed at huge generated files. |
+| `<name>.IgnoreDirs`         | comma/semicolon list            | *(none)*           | Extra directory **names** (matched at any depth) to skip in the workspace file-watch scan, on top of the built-in list. E.g. `Generated, ThirdParty`. |
+| `<name>.ServerEnv`          | `KEY=VALUE; KEY2=VALUE2`        | *(none)*           | Environment variables for the server process, merged over the editor's environment. Mainly for tuning servers that run on a VM - see [memory use](#memory-use). |
 | `<name>.LogVerbose`         | `true` / `false`                | `false`            | Log server traffic to the output panel. |
 
 ## Key bindings
@@ -92,11 +114,56 @@ With `InterceptCommands` on (the default), 10x's standard bindings already drive
 the language server, so no setup is needed. To bind the per-language functions
 explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
 `<Name>_GotoDefinition()`, `<Name>_Hover()`, `<Name>_FindReferences()`,
-`<Name>_SignatureHelp()`, `<Name>_ToggleComment()`, `<Name>_CommentLine()`,
+`<Name>_ListFunctions()`, `<Name>_ListSymbols()`, `<Name>_SignatureHelp()`,
+`<Name>_ToggleComment()`, `<Name>_CommentLine()`,
 `<Name>_UncommentLine()`, `<Name>_ShowDiagnostics()`, `<Name>_Restart()` and
 `<Name>_Status()`. The comment commands map to 10x's defaults:
 `Control Shift /` (toggle), `Control K, Control C` (comment),
 `Control K, Control U` (uncomment).
+
+## Command panel
+
+Every feature can also be run by typing `<Name> <command>` into 10x's command
+panel, no keybinding needed - e.g. `RustLSP status`, `CSharpLSP diagnostics`,
+`PythonLSP restart`. Commands: `status`, `complete`, `hover`, `signature`,
+`definition`, `references`, `functions`, `symbols [text]`, `diagnostics`,
+`restart`, `comment`, `commentline`, `uncommentline`.
+
+`symbols` is the only one that takes an argument - the term to search the project
+for, e.g. `RustLSP symbols Widget`. Without it the search uses the selected text
+or the word under the cursor.
+
+## Memory use
+
+Nearly all of the memory belongs to the **language server process**, not to this
+client. The server holds parsed syntax trees, compilations and symbol tables for
+everything it has been told to load, so the levers that matter are (in order):
+
+1. **Load less.** This is by far the biggest lever on a large repo. For C#, if
+   10x has a `.sln`/`.slnx` open as its workspace, Roslyn is pointed at exactly
+   that one automatically - no configuration needed. Otherwise the client opens
+   the first solution at the project root, or, failing that, *every* `.csproj`
+   under it, and Roslyn holds them all in memory. Set `CSharpLSP.Solution` to
+   avoid that fallback when your 10x workspace is a `.10x` file or a folder.
+2. **Tune the runtime.** Roslyn runs on .NET, so its footprint is largely GC
+   policy. `CSharpLSP.LowMemory: true` sets `DOTNET_GCConserveMemory=9` and
+   `DOTNET_gcServer=0` for the server process. Measured on a synthetic 400-file /
+   4800-method project: **peak working set 362 MB -> 183 MB (-49%)**, with no
+   measurable cost to project load time (7.1s both ways) or completion latency
+   (51 ms median both ways). The extra collection work scales with heap size, so
+   on a very large solution expect to trade some CPU for the saving. Use
+   `<name>.ServerEnv` to set other variables by hand.
+3. **Skip huge files.** `<name>.MaxFileSize` (in KB) stops oversized files being
+   sent at all. Both sides hold a copy of every open document, and on full-sync
+   servers the whole text is resent on each edit, so a few multi-MB generated
+   files cost more than they look. Skipped files get no language features, and
+   the output panel says which ones were skipped.
+
+`<name>.IgnoreDirs` only prunes *this client's* workspace file-watch scan (used
+for `workspace/didChangeWatchedFiles`); it does not stop the server from indexing
+those directories, so treat it as a CPU/IO saving rather than a memory one. Run
+`<Name>_Status()` to see the limits, extra ignores and server env currently in
+effect.
 
 ## Per-language setup
 
@@ -120,6 +187,11 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
   ```
   Install into the same Python that runs `pylsp`, then restart the server
   (`PythonLSP_Restart()`).
+- **No project-wide symbol search.** pylsp does not implement
+  `workspace/symbol` at all (it answers `Method Not Found`), so
+  `PythonLSP_ListSymbols()` reports that the server can't do it.
+  `PythonLSP_ListFunctions()` (current file) works fine. pyright does implement
+  it - see below.
 - **Alternative server:** pyright - `pip install pyright` and set
   `PythonLSP.Command: pyright-langserver --stdio`.
 
@@ -137,6 +209,11 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
 - **Project:** open a Cargo project (a folder with `Cargo.toml`); rust-analyzer
   discovers the workspace and dependencies from there. Non-Cargo projects need a
   `rust-project.json` at the root.
+- **Symbol search:** rust-analyzer searches *types only* by default. It reads two
+  suffixes on the query, which you can pass through the command panel: `#`
+  includes every symbol kind (functions, consts, ...) and `*` widens the search to
+  dependencies. So `RustLSP symbols parse#` finds functions named `parse`. An
+  empty query returns the workspace's types plus the crate roots.
 
 ### Odin (`OdinLSP.py`)
 
@@ -157,6 +234,10 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
     "enable_snippets": true
   }
   ```
+- **Symbol search:** OLS advertises `workspace/symbol` but returned no results at
+  all in testing (every query, including exact names, after a full index warm-up),
+  so `OdinLSP_ListSymbols()` will likely come up empty. There is no ols.json
+  option to change this. `OdinLSP_ListFunctions()` (current file) works.
 
 ### Jai (`JaiLSP.py`)
 
@@ -173,6 +254,9 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
   ```
   Without it, jails treats the opened file's folder as the workspace, which gives
   weaker cross-file results.
+- **Symbol search:** works with a search term (it matches struct members too, so
+  `Widget` also finds `Widget.size`). An empty query returns `null`, so put the
+  cursor on a word or type `JaiLSP symbols <text>`.
 
 ### C# (`CSharpLSP.py`)
 
@@ -202,7 +286,18 @@ explicitly instead (Settings -> Key Bindings), use `<Name>_Completion()`,
   `.csproj`. Unlike most servers, Roslyn does not auto-load a project on
   startup, so `CSharpLSP.py` sends the server the Roslyn-specific
   `solution/open` / `project/open` notification once it initializes - a solution
-  gives the best cross-project results.
+  gives the best cross-project results. What gets opened, in order: an explicit
+  `CSharpLSP.Solution`; the solution 10x itself has open (via
+  `GetWorkspaceFilename()`, which is skipped when the workspace is a `.10x` file
+  rather than a solution); the first `.sln`/`.slnx` at the project root; else
+  every `.csproj` found underneath.
+- **Memory:** Roslyn is the heaviest of the servers here. `CSharpLSP.Solution`
+  (load one solution/project instead of all of them) and `CSharpLSP.LowMemory:
+  true` (GC tuning, roughly halves peak working set) are the two levers - see
+  [memory use](#memory-use).
+- **Symbol search:** Roslyn needs a real search term - an empty
+  `workspace/symbol` query returns nothing at all. Put the cursor on a word, or
+  type `CSharpLSP symbols <text>` in the command panel.
 - **Remove `.cs` from `ParserExtensions`.** 10x lists `.cs` there by default,
   which makes its built-in parser fight the language server; drop `.cs` from that
   setting (see the note under [Installation](#installation)). CSharpLSP logs a

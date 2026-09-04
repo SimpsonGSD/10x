@@ -64,8 +64,16 @@
 #   Control Shift /:      RustLSP_ToggleComment()   (10x default)
 #   Control K, Control C: RustLSP_CommentLine()     (10x default)
 #   Control K, Control U: RustLSP_UncommentLine()   (10x default)
+#   (no binding needed)  RustLSP_ListFunctions()   (functions in this file)
+#   (no binding needed)  RustLSP_ListSymbols()     (project-wide symbol search)
 #   (no binding needed)  RustLSP_ShowDiagnostics()
 #   (no binding needed)  RustLSP_Restart()
+#
+# NOTE - RustLSP_ListSymbols() searches the project for the selected text (or the
+# word under the cursor); type "RustLSP symbols <text>" in the command panel to
+# search for something else. rust-analyzer matches TYPES only unless the query
+# ends with "#" (all symbol kinds) and searches dependencies too with "*" - e.g.
+# "RustLSP symbols parse#" finds functions named parse.
 # ---------------------------------------------------------------------------
 
 import os
@@ -125,6 +133,14 @@ def RustLSP_GotoDefinition():
 
 def RustLSP_FindReferences():
     _client.find_references()
+
+
+def RustLSP_ListSymbols():
+    _client.list_symbols()
+
+
+def RustLSP_ListFunctions():
+    _client.list_functions()
 
 
 def RustLSP_ShowDiagnostics():

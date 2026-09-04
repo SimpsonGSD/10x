@@ -58,6 +58,8 @@
 #   Control Shift /:      ZigLSP_ToggleComment()   (10x default)
 #   Control K, Control C: ZigLSP_CommentLine()     (10x default)
 #   Control K, Control U: ZigLSP_UncommentLine()   (10x default)
+#   (no binding needed)  ZigLSP_ListFunctions()   (functions in this file)
+#   (no binding needed)  ZigLSP_ListSymbols()     (project-wide symbol search)
 #   (no binding needed)  ZigLSP_ShowDiagnostics()
 #   (no binding needed)  ZigLSP_Restart()
 # ---------------------------------------------------------------------------
@@ -115,6 +117,14 @@ def ZigLSP_GotoDefinition():
 
 def ZigLSP_FindReferences():
     _client.find_references()
+
+
+def ZigLSP_ListSymbols():
+    _client.list_symbols()
+
+
+def ZigLSP_ListFunctions():
+    _client.list_functions()
 
 
 def ZigLSP_ShowDiagnostics():

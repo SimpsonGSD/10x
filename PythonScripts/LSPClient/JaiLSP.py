@@ -65,6 +65,8 @@
 #   Control Shift /:      JaiLSP_ToggleComment()   (10x default)
 #   Control K, Control C: JaiLSP_CommentLine()     (10x default)
 #   Control K, Control U: JaiLSP_UncommentLine()   (10x default)
+#   (no binding needed)  JaiLSP_ListFunctions()   (functions in this file)
+#   (no binding needed)  JaiLSP_ListSymbols()     (project-wide symbol search)
 #   (no binding needed)  JaiLSP_ShowDiagnostics()
 #   (no binding needed)  JaiLSP_Restart()
 # ---------------------------------------------------------------------------
@@ -125,6 +127,14 @@ def JaiLSP_GotoDefinition():
 
 def JaiLSP_FindReferences():
     _client.find_references()
+
+
+def JaiLSP_ListSymbols():
+    _client.list_symbols()
+
+
+def JaiLSP_ListFunctions():
+    _client.list_functions()
 
 
 def JaiLSP_ShowDiagnostics():

@@ -43,6 +43,11 @@
 #                           bindings drive the language server for files we
 #                           handle. Default true; set "false" to require the
 #                           per-language <Name>_* functions instead.
+#     <name>.SignatureHelp  "true"/"false" - put 10x's function-args box up when
+#                           you type a call's "(" (default true). It is never
+#                           re-opened by the cursor moving back between the
+#                           parentheses - ShowFunctionArgsInfo does that on
+#                           demand. Set "false" for on demand only.
 #     <name>.Commenting     "true"/"false" - handle 10x's ToggleComment /
 #                           CommentLine / UncommentLine for files we handle,
 #                           using the language's comment token (default true).
@@ -243,6 +248,48 @@ def strip_markdown_escapes(text):
     return _MD_ESCAPE.sub(r"\1", text)
 
 
+def _flatten(text):
+    """Collapse text to a single line: every run of whitespace (newlines and the
+    indentation servers use to wrap long signatures included) becomes one space."""
+    return " ".join((text or "").split())
+
+
+def _clean_signature_text(text):
+    """Run server-supplied signature/parameter text through the same cleanups the
+    hover box needs (fences, HTML entities, Markdown escapes)."""
+    return strip_markdown_escapes(strip_markup_html(strip_code_fences(text or "")))
+
+
+def signature_items(result, max_len=200, max_items=16):
+    """Render a textDocument/signatureHelp result as the rows of 10x's
+    function-args box (N10X.Editor.ShowFunctionArgsListBox): one overload per
+    row, the active one LAST, since 10x highlights the bottom row.
+
+        void Copy(byte[] src)
+        void Copy(byte[] src, int count)     <- active, highlighted by 10x
+
+    Rows are plain text, collapsed to a single line (server labels can span
+    lines) and capped at `max_len`. Returns [] when there is nothing worth
+    showing, so callers can leave the box alone rather than blank it."""
+    if not isinstance(result, dict):
+        return []
+    sigs = [s for s in (result.get("signatures") or []) if isinstance(s, dict)]
+    if not sigs:
+        return []
+    active = result.get("activeSignature")
+    if not isinstance(active, int) or not 0 <= active < len(sigs):
+        active = 0
+    # Active overload last - 10x highlights the bottom row. Truncation drops the
+    # other overloads from the top for the same reason: the active one stays.
+    order = [i for i in range(len(sigs)) if i != active] + [active]
+    rows = []
+    for i in order[-max_items:]:
+        row = _flatten(_clean_signature_text(sigs[i].get("label") or ""))
+        if row:
+            rows.append(row[:max_len])
+    return rows
+
+
 def first_location(result):
     """Normalise Location | Location[] | LocationLink[] to (uri, range)."""
     if not result:
@@ -299,7 +346,7 @@ class LSPConnection:
     parsed messages is done by the owner on the main thread.
     """
 
-    def __init__(self, argv, cwd, log=None, verbose=None):
+    def __init__(self, argv, cwd, log=None, verbose=None, env=None):
         self._log = log or (lambda m: None)
         self._verbose = verbose or (lambda: False)
         self.incoming = queue.Queue()
@@ -307,8 +354,15 @@ class LSPConnection:
         self._next_id = 1
         self.alive = False
 
+        # env overrides are merged onto the editor's own environment rather than
+        # replacing it - the server still needs PATH, HOME, etc. to run.
+        proc_env = None
+        if env:
+            proc_env = dict(os.environ)
+            proc_env.update({str(k): str(v) for k, v in env.items()})
+
         self.proc = subprocess.Popen(
-            argv, cwd=cwd,
+            argv, cwd=cwd, env=proc_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             bufsize=0, creationflags=_NO_WINDOW)
         self.alive = True
@@ -501,7 +555,8 @@ class LanguageServerClient:
     def __init__(self, name, language_id, extensions, default_command="",
                  fallback_argv=None, trigger_chars="", root_markers=None,
                  init_options=None, ignore_dirs=None, line_comment="",
-                 on_initialized=None, server_cwd=None, pull_diagnostics=False):
+                 on_initialized=None, server_cwd=None, pull_diagnostics=False,
+                 server_env=None):
         self.name = name
         self.language_id = language_id
         self.extensions = tuple(extensions)
@@ -531,15 +586,20 @@ class LanguageServerClient:
         self._diag_pull_due = 0.0        # time.time() at which to flush the queue
         self._diag_pull_delay = 0.35     # debounce so we don't pull every keystroke
         self.ignore_dirs = _COMMON_IGNORE_DIRS | frozenset(ignore_dirs or ())
+        # Environment overrides for the server process: a dict, or a
+        # callable(client) -> dict evaluated at launch (so it can read settings).
+        self.server_env = server_env
         self.disabled = False
 
         self.conn = None
         self.initialized = False
+        self.server_caps = {}    # capabilities from the initialize result
         self.root_uri = None
         self.root_path = None
         self._sync_kind = 1  # server textDocumentSync.change: 0 none/1 full/2 incremental
         self.pending = {}        # request id -> handler(result, error)
         self.docs = {}           # uri -> {"version", "text", "filename"}
+        self._skipped_docs = set()  # uris over MaxFileSize; never sent to server
         self.diagnostics = {}    # uri -> [Diagnostic]
         self._last_sync = 0.0
         self._sync_interval = 0.35
@@ -549,6 +609,17 @@ class LanguageServerClient:
         self._completion_inflight = False  # a completion request is awaiting reply
         self._completion_req_pos = None  # cursor (x, y) when that request was sent
         self._autocomplete_visible = False  # our completion popup is on screen
+        # Auto signature help ("function args info"). While the cursor sits
+        # inside a call's parentheses we keep 10x's function-args box filled with
+        # the signature for that call. See _refresh_signature_help.
+        self._sig_anchor = None      # (x, y) of the "(" of the call we're inside
+        self._sig_items = []         # rows last handed to the args box
+        self._sig_due = 0.0          # time.time() at which to (re-)request it
+        self._sig_dirty = False      # input happened; re-check on the next tick
+        self._sig_visible = False    # the args box is (believed) on screen
+        self._sig_tries = 0          # requests made for the current call
+        self._sig_typed_open = False # a "(" was typed since the last tick
+        self._sig_session = False    # this call's box is ours to fill
         self._last_cursor_pos = None     # (x, y) at the previous cursor-move event
         self._last_line_text = None      # current line text at that event (edit vs move)
         self._last_status_line = -1
@@ -636,6 +707,41 @@ class LanguageServerClient:
             return self.root_path
         return target
 
+    def _resolve_server_env(self):
+        """Environment overrides for the server process. Merges the per-language
+        server_env (a dict, or a callable(client) -> dict so it can react to
+        settings) with the user's "<name>.ServerEnv" setting, which wins.
+
+        The setting is a semicolon- or comma-separated list of KEY=VALUE pairs:
+            CSharpLSP.ServerEnv: DOTNET_GCConserveMemory=9; DOTNET_gcServer=0
+        Mostly useful for memory/GC tuning of servers that run on a VM - see the
+        LowMemory notes in CSharpLSP.py."""
+        env = {}
+        src = self.server_env
+        if callable(src):
+            try:
+                src = src(self)
+            except Exception as e:
+                self.log(f"server_env callable failed ({e}); ignoring")
+                src = None
+        if src:
+            env.update(src)
+        raw = self.setting("ServerEnv").strip()
+        for pair in re.split(r"[;,]", raw):
+            pair = pair.strip()
+            if not pair:
+                continue
+            key, sep, value = pair.partition("=")
+            if not sep or not key.strip():
+                self.log(f"ignoring malformed {self.name}.ServerEnv entry '{pair}' "
+                         f"(expected KEY=VALUE)")
+                continue
+            env[key.strip()] = value.strip()
+        if env and self._verbose():
+            self.log("server env overrides: " +
+                     ", ".join(f"{k}={v}" for k, v in sorted(env.items())))
+        return env
+
     def ensure_started(self, root_hint):
         if self.conn and self.conn.alive:
             return True
@@ -649,9 +755,10 @@ class LanguageServerClient:
             self.log("no server command configured; set " + self.name + ".Command")
             return False
         cwd = self._resolve_server_cwd()
+        env = self._resolve_server_env()
         try:
-            self.conn = LSPConnection(argv, cwd,
-                                      log=self.log, verbose=self._verbose)
+            self.conn = LSPConnection(argv, cwd, log=self.log,
+                                      verbose=self._verbose, env=env)
         except FileNotFoundError:
             self.log(f"could not launch server: '{argv[0]}' not found. "
                      f"Install it or set {self.name}.Command.")
@@ -678,6 +785,7 @@ class LanguageServerClient:
                 "workspace": {
                     "configuration": True,
                     "workspaceFolders": True,
+                    "symbol": {"dynamicRegistration": False},
                     "didChangeConfiguration": {"dynamicRegistration": True},
                     # Let servers register file watchers with us. We don't watch
                     # the FS via the OS; instead, when a server registers we run
@@ -695,9 +803,25 @@ class LanguageServerClient:
                                            "documentationFormat": ["plaintext", "markdown"]},
                     },
                     "hover": {"contentFormat": ["plaintext", "markdown"]},
-                    "signatureHelp": {},
+                    "signatureHelp": {
+                        # 10x's function-args box shows plain rows, so we only
+                        # ever render signature labels - no parameter detail is
+                        # asked for. contextSupport tells the server whether a
+                        # request came from a trigger char or is a re-trigger
+                        # while the same call is still being typed.
+                        "contextSupport": True,
+                        "signatureInformation": {
+                            "documentationFormat": ["plaintext", "markdown"],
+                        },
+                    },
                     "definition": {"linkSupport": True},
                     "references": {},
+                    "documentSymbol": {
+                        # Accept the modern nested DocumentSymbol[] shape (we
+                        # flatten it) as well as the legacy flat
+                        # SymbolInformation[]; _on_document_symbols handles both.
+                        "hierarchicalDocumentSymbolSupport": True,
+                    },
                     "publishDiagnostics": {"relatedInformation": False},
                 },
             },
@@ -729,6 +853,10 @@ class LanguageServerClient:
         # Honour the server's document-sync mode. textDocumentSync may be a bare
         # number or an object with a "change" field: 0 none, 1 full, 2 incremental.
         caps = (result or {}).get("capabilities", {}) or {}
+        # Keep the whole capability set: some commands need to know up front
+        # whether the server implements a request at all (e.g. pylsp answers
+        # workspace/symbol with MethodNotFound - see list_symbols).
+        self.server_caps = caps
         sync = caps.get("textDocumentSync", 1)
         self._sync_kind = sync.get("change", 1) if isinstance(sync, dict) else sync
         if self._verbose():
@@ -769,10 +897,14 @@ class LanguageServerClient:
             self.conn.shutdown()
         self.conn = None
         self.initialized = False
+        self.server_caps = {}
         self.pending.clear()
         self.docs.clear()
+        self._skipped_docs.clear()
         self.diagnostics.clear()
         self.disabled = False
+        # A signature on screen belongs to the server that answered for it.
+        self._hide_signature()
         # Drop pull-diagnostics state with the connection; it re-arms on the
         # next initialize.
         self._pull_active = False
@@ -789,11 +921,37 @@ class LanguageServerClient:
     def _ready(self):
         return bool(self.conn and self.conn.alive and self.initialized)
 
+    def _max_file_bytes(self):
+        """"<name>.MaxFileSize" in KB, as bytes. 0/unset means no limit."""
+        try:
+            return max(0, int(self.setting("MaxFileSize", "0"))) * 1024
+        except (TypeError, ValueError):
+            return 0
+
+    def _too_big(self, filename, text):
+        """Whether this file is over the MaxFileSize limit. Oversized files are
+        never sent to the server: we hold their full text in self.docs and (on
+        full-sync servers) resend all of it on every edit, and the server then
+        parses and holds its own copy. Generated files - .designer.cs, huge
+        interop bindings - are the usual offenders."""
+        limit = self._max_file_bytes()
+        if not limit:
+            return False
+        size = len(text.encode("utf-8", "ignore")) if text else 0
+        if size <= limit:
+            return False
+        self.log(f"skipping {os.path.basename(filename)}: {size // 1024} KB "
+                 f"exceeds {self.name}.MaxFileSize ({limit // 1024} KB); "
+                 f"language features are off for this file")
+        return True
+
     def did_open(self, filename):
         if not self._ready():
             return
         uri = path_to_uri(filename)
         if uri in self.docs:
+            return
+        if uri in self._skipped_docs:
             return
         try:
             text = N10X.Editor.GetFileText(filename)
@@ -801,6 +959,10 @@ class LanguageServerClient:
             text = N10X.Editor.GetFileText()
         if text is None:
             text = ""
+        if self._too_big(filename, text):
+            # Remember it so we don't re-read and re-warn on every sync tick.
+            self._skipped_docs.add(uri)
+            return
         self.docs[uri] = {"version": 1, "text": text, "filename": filename}
         self.conn.notify("textDocument/didOpen", {
             "textDocument": {"uri": uri, "languageId": self.language_id,
@@ -865,6 +1027,10 @@ class LanguageServerClient:
     def _doc_pos_params(self, pos=None):
         filename = N10X.Editor.GetCurrentFilename()
         if not self.handles(filename):
+            return None
+        # The server was never told about an oversized file, so asking it about a
+        # position in one would be answered against a document it doesn't have.
+        if path_to_uri(filename) in self._skipped_docs:
             return None
         x, y = N10X.Editor.GetCursorPos()
         if pos is not None:
@@ -977,6 +1143,19 @@ class LanguageServerClient:
                 self._watch_enabled = False
                 self._watch_mtimes = {}
 
+    def _all_ignore_dirs(self):
+        """Directory names the workspace scan skips: the built-in set plus
+        anything in "<name>.IgnoreDirs" (comma/semicolon separated), e.g.
+
+            CSharpLSP.IgnoreDirs: Generated, ThirdParty, TestData
+
+        Matching is on the directory NAME at any depth, not on a path."""
+        extra = self.setting("IgnoreDirs").strip()
+        if not extra:
+            return self.ignore_dirs
+        names = {p.strip() for p in re.split(r"[;,]", extra) if p.strip()}
+        return self.ignore_dirs | names
+
     def _snapshot_watched_files(self):
         """Map every workspace file we handle to its mtime. Cheap enough to run
         on a few-second cadence; heavy/irrelevant directories are skipped. Used
@@ -985,7 +1164,7 @@ class LanguageServerClient:
         root = self.root_path
         if not root or not os.path.isdir(root):
             return snap
-        ignore = self.ignore_dirs
+        ignore = self._all_ignore_dirs()
         for dirpath, dirnames, filenames in os.walk(root):
             # Prune noisy directories in place so os.walk never descends them.
             dirnames[:] = [d for d in dirnames if d not in ignore]
@@ -1426,18 +1605,227 @@ class LanguageServerClient:
             return
         self._show_hover_box(text, pos)
 
-    def _on_signature(self, result, error, pos=None):
-        if error or not result or not result.get("signatures"):
-            N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+    # -- signature help ("function args info") -----------------------------
+    #
+    # 10x owns the box: ShowFunctionArgsListBox fills it with one row per
+    # overload, the user picks one with up/down, and an empty list takes it down.
+    # Two rules follow. The rows go up ONCE per call - re-pushing them resets the
+    # user's selection - and only when the user types the call's "(", so a box
+    # they dismissed stays dismissed until ShowFunctionArgsInfo.
+
+    def signature_help_enabled(self):
+        """On unless turned off, and only for a server that implements signature
+        help on a 10x build that has the function-args box."""
+        return (self.setting("SignatureHelp") != "false"
+                and bool(self.server_caps.get("signatureHelpProvider"))
+                and hasattr(N10X.Editor, "ShowFunctionArgsListBox"))
+
+    def _code_brackets(self, line):
+        """[(index, char), ...] for every bracket and ";" in `line` that isn't
+        inside a string literal or a line comment - i.e. the ones that actually
+        nest code, so "f(\"a)b\")" isn't read as an unbalanced call.
+
+        Quote handling is deliberately minimal: a single quote only opens a
+        literal when the same line closes it, so Rust lifetimes ("&'a T") and
+        stray apostrophes in comments don't swallow the rest of the line."""
+        out = []
+        i, n, quote = 0, len(line), ""
+        while i < n:
+            c = line[i]
+            if quote:
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == quote:
+                    quote = ""
+            elif c == '"' or (c == "'" and "'" in line[i + 1:]):
+                quote = c
+            elif self.line_comment and line.startswith(self.line_comment, i):
+                break  # rest of the line is a comment
+            elif c in "()[]{};":
+                out.append((i, c))
+            i += 1
+        return out
+
+    def _enclosing_call_paren(self, max_lines=24):
+        """(x, y) of the "(" of the innermost call the cursor is inside, else
+        None. This is what decides whether the args box should be up at all, and
+        - because it identifies the specific call - when to throw away a
+        signature because the user moved into a different one.
+
+        Scans backwards from the cursor, bracket-matching as it goes. Balanced
+        [...] and {...} are transparent (an argument can be a list or an object
+        literal). An unmatched "[" is transparent too - the cursor is inside a
+        list that is itself an argument - but an unmatched "{" is a block (or a
+        statement-level literal) and an unmatched ";" ends the statement, so in
+        both cases there is no enclosing call to describe."""
+        try:
+            x, y = N10X.Editor.GetCursorPos()
+        except Exception:
+            return None
+        depth = {")": 0, "]": 0, "}": 0}
+        for ln in range(y, max(-1, y - max_lines), -1):
+            try:
+                text, _ = self._split_eol(N10X.Editor.GetLine(ln) or "")
+            except Exception:
+                return None
+            if ln == y:
+                text = text[:x]
+            for i, c in reversed(self._code_brackets(text)):
+                if c in depth:
+                    depth[c] += 1
+                elif c == "(":
+                    if depth[")"] == 0:
+                        return (i, ln)
+                    depth[")"] -= 1
+                elif c == "[":
+                    if depth["]"]:
+                        depth["]"] -= 1
+                elif c == "{":
+                    if not depth["}"]:
+                        return None
+                    depth["}"] -= 1
+                elif c == ";" and not depth[")"]:
+                    return None
+        return None
+
+    def _show_signature(self):
+        """Open 10x's function-args box, once per call.
+
+        The position is the caret as it is when a call is opened - just after the
+        "(" - which is what 10x binds the box to and tracks the arguments from.
+        ShowFunctionArgsInfo mid-call passes the same place, so the box always
+        appears at the start of the argument list."""
+        if not self._sig_items:
             return
-        sigs = result["signatures"]
-        active = result.get("activeSignature", 0) or 0
-        sig = sigs[active] if active < len(sigs) else sigs[0]
-        label = sig.get("label", "")
-        if not label.strip():
-            N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+        if self._sig_anchor is not None:
+            pos = (self._sig_anchor[0] + 1, self._sig_anchor[1])
+        else:
+            try:
+                pos = N10X.Editor.GetCursorPos()
+            except Exception:
+                pos = None
+        if self._verbose():
+            self.log(f"args box at {pos}: {len(self._sig_items)} row(s); "
+                     f"{self._sig_items[0]!r}")
+        try:
+            if pos is None:
+                N10X.Editor.ShowFunctionArgsListBox(self._sig_items)
+            else:
+                N10X.Editor.ShowFunctionArgsListBox(self._sig_items, pos)
+            self._sig_visible = True
+        except AttributeError:
+            # Older 10x without the function-args box: fall back to a one-shot
+            # hover box, which the next key press dismisses.
+            self._show_hover_box("\n".join(self._sig_items), None)
+        except Exception as e:
+            self.log(f"ShowFunctionArgsListBox failed: {e}")
+
+    def _clear_args_box(self):
+        """Take the args box off screen. An empty list dismisses it, as it does
+        the autocomplete one."""
+        if not self._sig_visible:
             return
-        self._show_hover_box(label, pos)
+        self._sig_visible = False
+        try:
+            N10X.Editor.ShowFunctionArgsListBox([])
+        except Exception:
+            pass
+
+    def _hide_signature(self):
+        """End the session: there is no call under the cursor to describe."""
+        self._sig_anchor = None
+        self._sig_items = []
+        self._sig_due = 0.0
+        self._sig_tries = 0
+        self._sig_session = False
+        self._clear_args_box()
+
+    def _refresh_signature_help(self, now):
+        """Re-evaluate the args box after an input event: end the session when the
+        cursor leaves the call, start one when the user types a call's "(", and
+        otherwise leave the box alone."""
+        opened, self._sig_typed_open = self._sig_typed_open, False
+        if not self._ready():
+            self._hide_signature()
+            return
+        try:
+            if not self.handles(N10X.Editor.GetCurrentFilename()):
+                self._hide_signature()
+                return
+        except Exception:
+            return
+        anchor = self._enclosing_call_paren()
+        if anchor is None:
+            self._hide_signature()
+            return
+        if not self.signature_help_enabled():
+            # Auto-open off: a box from ShowFunctionArgsInfo stays until the
+            # cursor leaves that call.
+            if anchor != self._sig_anchor:
+                self._hide_signature()
+            return
+        if anchor != self._sig_anchor:
+            # A different call: take the old rows down so a signature is never
+            # left up against the wrong arguments.
+            self._sig_anchor = anchor
+            self._sig_items = []
+            self._sig_session = False
+            self._clear_args_box()
+        if opened and not self._sig_session:
+            # The user just typed this call's "(". Tested outside the branch
+            # above because the cursor-move event for the same keystroke can land
+            # first, updating the anchor before this flag is seen.
+            self._sig_session = True
+            self._sig_tries = 0
+            self._sig_due = now
+        elif (self._sig_session and not self._sig_items
+                and self._sig_tries < 3):
+            # Our call, nothing to show yet (server still loading, or the line
+            # didn't parse). Retry as the user types, but only a few times so an
+            # "if (x" doesn't ask forever.
+            due = now + self._auto_delay
+            if not self._sig_due or due < self._sig_due:
+                self._sig_due = due
+
+    def _request_signature_help(self, manual=False):
+        params = self._doc_pos_params()
+        if params is None:
+            if manual:
+                N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+            return
+        # We advertise contextSupport, so say why we're asking: an automatic
+        # request always follows a typed "(".
+        if manual:
+            context = {"triggerKind": 1,          # Invoked
+                       "isRetrigger": bool(self._sig_items)}
+        else:
+            context = {"triggerKind": 2,          # TriggerCharacter
+                       "triggerCharacter": "(",
+                       "isRetrigger": self._sig_tries > 0}
+            self._sig_tries += 1
+        params["context"] = context
+        self.sync_current(force=True)
+        anchor = self._sig_anchor
+        self._send_request("textDocument/signatureHelp", params,
+                           lambda r, e: self._on_signature(r, e, anchor, manual))
+
+    def _on_signature(self, result, error, anchor=None, manual=True):
+        # The cursor can move to another call while the server answers; a reply
+        # that no longer describes the call we're in is dropped.
+        if not manual and anchor != self._sig_anchor:
+            return
+        items = [] if error else signature_items(result)
+        if not manual and items == self._sig_items and self._sig_visible:
+            return  # 10x is already showing this list - leave the user's choice
+        if not items:
+            if manual:
+                N10X.Editor.SetStatusBarText(f"{self.name}: no signature")
+            # Otherwise leave the box alone: a null answer mid-edit shouldn't
+            # blank what the user is reading.
+            return
+        self._sig_items = items
+        self._show_signature()
 
     def _on_definition(self, result, error, retry=0):
         loc = first_location(result)
@@ -1489,20 +1877,133 @@ class LanguageServerClient:
             if length < 0:
                 length = 0
             items.append((path, line, index, length))
+        self._present_locations(items, "reference")
+
+    def _present_locations(self, items, noun):
+        """Hand a list of (path, line, index, length) tuples to 10x's navigable
+        symbol-references list. `noun` names them for status/log text (e.g.
+        "reference", "symbol"). Falls back to the output panel on older 10x."""
         if not items:
-            N10X.Editor.SetStatusBarText(f"{self.name}: no references found")
+            N10X.Editor.SetStatusBarText(f"{self.name}: no {noun}s found")
             return
         try:
             N10X.Editor.ShowSymbolReferences(items)
         except AttributeError:
             # Older 10x without ShowSymbolReferences: log to the output panel.
-            self.log(f"{len(items)} reference(s):")
+            self.log(f"{len(items)} {noun}(s):")
             for path, line, index, _ in items:
                 self.log(f"  {path}:{line + 1}:{index + 1}")
             N10X.Editor.SetStatusBarText(
-                f"{self.name}: {len(items)} reference(s) - see output panel")
+                f"{self.name}: {len(items)} {noun}(s) - see output panel")
         except Exception as e:
             self.log(f"ShowSymbolReferences failed: {e}")
+
+    # LSP SymbolKind values that are "functions" for list_symbols: Method (6),
+    # Constructor (9), Function (12). Other kinds (classes, fields, ...) are the
+    # symbols a function lives in, not functions themselves, so we skip them.
+    _FUNCTION_SYMBOL_KINDS = frozenset((6, 9, 12))
+
+    def _on_document_symbols(self, result, error, filename):
+        if error or not result:
+            N10X.Editor.SetStatusBarText(f"{self.name}: no symbols found")
+            return
+        # textDocument/documentSymbol returns either a nested DocumentSymbol[]
+        # (each with a "range"/"selectionRange" and possibly "children") or a
+        # flat SymbolInformation[] (each with a "location"). Flatten both to a
+        # single list of function-like symbols.
+        default_path = uri_to_path(path_to_uri(filename))
+        seen, items = set(), []
+
+        def add(kind, path, rng):
+            if kind not in self._FUNCTION_SYMBOL_KINDS or not rng:
+                return
+            start = rng.get("start", {})
+            line = start.get("line", 0)
+            index = start.get("character", 0)
+            key = (path, line, index)
+            if key in seen:
+                return
+            seen.add(key)
+            end = rng.get("end", {})
+            length = (end.get("character", index) - index
+                      if end.get("line", line) == line else 0)
+            items.append((path, line, index, max(length, 0)))
+
+        def walk(nodes):
+            for node in nodes:
+                if "location" in node:            # SymbolInformation
+                    loc = node.get("location", {})
+                    add(node.get("kind"), uri_to_path(loc.get("uri", "")),
+                        loc.get("range"))
+                else:                             # DocumentSymbol
+                    # selectionRange points at the name; nicer to land on than
+                    # the whole body range. Fall back to range if it's missing.
+                    add(node.get("kind"), default_path,
+                        node.get("selectionRange") or node.get("range"))
+                    walk(node.get("children") or [])
+
+        walk(result)
+        items.sort(key=lambda it: (it[0], it[1], it[2]))
+        self._present_locations(items, "function")
+
+    def _on_workspace_symbols(self, result, error, query=""):
+        if error:
+            # -32601 is MethodNotFound: the server doesn't implement
+            # workspace/symbol (pylsp, for one, despite answering
+            # textDocument/documentSymbol quite happily).
+            if (error or {}).get("code") == -32601:
+                self._no_workspace_symbols()
+            else:
+                self.log(f"workspace/symbol failed: {error}")
+                N10X.Editor.SetStatusBarText(
+                    f"{self.name}: symbol search failed - see output panel")
+            return
+        if not result:
+            # workspace/symbol is a search, not a dump. Servers differ on what an
+            # empty query means: rust-analyzer answers with the workspace's types,
+            # Roslyn returns nothing at all. Say which query came back empty so
+            # it's obvious a search term is needed.
+            if query:
+                N10X.Editor.SetStatusBarText(
+                    f"{self.name}: no symbols matching '{query}'")
+            else:
+                N10X.Editor.SetStatusBarText(
+                    f"{self.name}: this server needs a search term - put the "
+                    f"cursor on a word, or type '{self.name} symbols <text>'")
+            return
+        # workspace/symbol returns a flat SymbolInformation[] (or, in LSP 3.17,
+        # WorkspaceSymbol[]); both carry a "location". A WorkspaceSymbol may give
+        # only {"uri": ...} with no range (it expects a workspaceSymbol/resolve
+        # round-trip) - we just land at the top of that file in that case. Every
+        # symbol kind is listed here (this is the project-wide index), unlike
+        # list_functions which is functions only.
+        seen, items = set(), []
+        for sym in result:
+            loc = sym.get("location", {})
+            path = uri_to_path(loc.get("uri", ""))
+            if not path:
+                continue
+            rng = loc.get("range", {})
+            start = rng.get("start", {})
+            line = start.get("line", 0)
+            index = start.get("character", 0)
+            key = (path, line, index)
+            if key in seen:
+                continue
+            seen.add(key)
+            end = rng.get("end", {})
+            length = (end.get("character", index) - index
+                      if end.get("line", line) == line else 0)
+            items.append((path, line, index, max(length, 0)))
+        items.sort(key=lambda it: (it[0], it[1], it[2]))
+        self._present_locations(items, "symbol")
+
+    def _no_workspace_symbols(self):
+        """Tell the user this server can't do a project-wide symbol search."""
+        msg = (f"{self.name}: server has no project-wide symbol search "
+               f"(workspace/symbol) - use ListFunctions for the current file")
+        self.log(msg)
+        N10X.Editor.SetStatusBarText(msg)
 
     # -- public commands (wire these to keybindings) ----------------------
 
@@ -1551,10 +2052,28 @@ class LanguageServerClient:
         self.log(f"  server argv     : {self._server_argv()}")
         self.log(f"  connection      : {'alive' if (self.conn and self.conn.alive) else 'none/dead'}")
         self.log(f"  initialized     : {self.initialized}")
+        # Not every server implements every request; these two decide whether
+        # ListFunctions / ListSymbols can work at all (pylsp, for one, has no
+        # workspace/symbol).
+        self.log(f"  documentSymbol  : "
+                 f"{bool(self.server_caps.get('documentSymbolProvider'))} "
+                 f"(ListFunctions)")
+        self.log(f"  workspaceSymbol : "
+                 f"{bool(self.server_caps.get('workspaceSymbolProvider'))} "
+                 f"(ListSymbols)")
         self.log(f"  root            : {self.root_path}")
         self.log(f"  current file    : {fn}")
         self.log(f"  handled         : {self.handles(fn)}")
         self.log(f"  open documents  : {len(self.docs)}")
+        limit = self._max_file_bytes()
+        self.log(f"  max file size   : "
+                 f"{str(limit // 1024) + ' KB' if limit else 'unlimited'}"
+                 f"{f' ({len(self._skipped_docs)} skipped)' if self._skipped_docs else ''}")
+        extra = sorted(self._all_ignore_dirs() - self.ignore_dirs)
+        self.log(f"  extra ignores   : {', '.join(extra) if extra else '(none)'}")
+        env = self._resolve_server_env()
+        self.log(f"  server env      : "
+                 f"{', '.join(f'{k}={v}' for k, v in sorted(env.items())) or '(none)'}")
 
     def hover(self, pos=None):
         params = self._doc_pos_params(pos)
@@ -1569,13 +2088,15 @@ class LanguageServerClient:
                            lambda r, e: self._on_hover(r, e, pos))
 
     def signature_help(self):
-        params = self._doc_pos_params()
-        if params is None:
-            return
-        self.sync_current(force=True)
-        pos = N10X.Editor.GetCursorPos()
-        self._send_request("textDocument/signatureHelp", params,
-                           lambda r, e: self._on_signature(r, e, pos))
+        """ShowFunctionArgsInfo / the "signature" command: put the overloads for
+        the call under the cursor up now, at that call's opening "(". The only
+        way back once the box has been dismissed."""
+        self._sig_anchor = self._enclosing_call_paren()
+        self._sig_items = []
+        self._sig_due = 0.0
+        self._sig_tries = 0
+        self._sig_session = True
+        self._request_signature_help(manual=True)
 
     def goto_definition(self, _retry=0):
         params = self._doc_pos_params()
@@ -1592,6 +2113,80 @@ class LanguageServerClient:
         params["context"] = {"includeDeclaration": True}
         self.sync_current(force=True)
         self._send_request("textDocument/references", params, self._on_references)
+
+    def list_functions(self):
+        """List the functions/methods in the CURRENT file in 10x's navigable
+        symbol-references list (via textDocument/documentSymbol)."""
+        filename = N10X.Editor.GetCurrentFilename()
+        if not self.handles(filename):
+            return
+        if path_to_uri(filename) in self._skipped_docs:
+            N10X.Editor.SetStatusBarText(
+                f"{self.name}: file skipped (over {self.name}.MaxFileSize)")
+            return
+        self.sync_current(force=True)
+        params = {"textDocument": {"uri": path_to_uri(filename)}}
+        self._send_request(
+            "textDocument/documentSymbol", params,
+            lambda r, e: self._on_document_symbols(r, e, filename))
+
+    def list_symbols(self, query=None):
+        """Search symbols across the WHOLE project and show the matches in 10x's
+        navigable symbol-references list (via workspace/symbol).
+
+        Note this is a SEARCH, not an enumeration: LSP has no "give me every
+        symbol" request, and most servers return nothing for an empty query
+        (Roslyn does; rust-analyzer answers with the workspace's types). So with
+        no argument we search for the selected text, falling back to the word
+        under the cursor. Pass a string to search for something else - from the
+        command panel that's "<Name> symbols <text>"."""
+        if not self._ready():
+            self.log("server not ready")
+            return
+        # Some servers (pylsp) implement documentSymbol but not workspace/symbol.
+        # They say so at initialize; better to explain than to fire a request
+        # that comes back MethodNotFound.
+        if self.server_caps and not self.server_caps.get("workspaceSymbolProvider"):
+            self._no_workspace_symbols()
+            return
+        if query is None:
+            query = self._selected_text() or self._word_at_cursor()
+        query = (query or "").strip()
+        self._send_request("workspace/symbol", {"query": query},
+                           lambda r, e: self._on_workspace_symbols(r, e, query))
+
+    def _selected_text(self):
+        """The selected text when it's a single-line snippet we can search for,
+        else "". Used to seed the project-wide symbol search."""
+        try:
+            text = N10X.Editor.GetSelection() or ""
+        except Exception:
+            return ""
+        text = text.strip()
+        return "" if "\n" in text or "\r" in text else text
+
+    def _word_at_cursor(self):
+        """The whole identifier the cursor sits in or next to (unlike
+        _completion_word, which stops at the cursor). "" if there isn't one."""
+        try:
+            line = N10X.Editor.GetCurrentLine() or ""
+            x, _ = N10X.Editor.GetCursorPos()
+        except Exception:
+            return ""
+        if not line:
+            return ""
+        x = max(0, min(x, len(line)))
+
+        def is_word(c):
+            return c.isalnum() or c == "_"
+
+        start = x
+        while start > 0 and is_word(line[start - 1]):
+            start -= 1
+        end = x
+        while end < len(line) and is_word(line[end]):
+            end += 1
+        return line[start:end]
 
     # -- comment toggling --------------------------------------------------
     # Commenting is a purely editor-side text edit (LSP has no comment API), so
@@ -1715,19 +2310,28 @@ class LanguageServerClient:
             self.log(f"on_post_save error: {e}")
 
     def _on_char_key(self, ch=None, *args):
-        # As-you-type completion: schedule a (debounced) completion request when
-        # an identifier char or a trigger char is typed. Each keystroke pushes
-        # the due time forward, so a burst of typing fires a single request once
-        # the user pauses for _auto_delay seconds.
-        if not ch or self.setting("AutoComplete") == "false":
+        # A typed character can open or close a call, so re-check the args box on
+        # the next tick, by which point the character is in the buffer.
+        self._sig_dirty = True
+        if not ch:
             return
-        # Only schedule completion when the focused file is one we handle;
-        # otherwise typing in another language's file (e.g. after switching
-        # workspaces) would queue requests that just get rejected.
+        # Only act when the focused file is one we handle; otherwise typing in
+        # another language's file (e.g. after switching workspaces) would queue
+        # requests that just get rejected.
         try:
             if not self.handles(N10X.Editor.GetCurrentFilename()):
                 return
         except Exception:
+            return
+        # A typed "(" is the one thing that opens the args box by itself;
+        # _refresh_signature_help consumes this on the next tick.
+        if ch == "(":
+            self._sig_typed_open = True
+        # As-you-type completion: schedule a (debounced) completion request when
+        # an identifier char or a trigger char is typed. Each keystroke pushes
+        # the due time forward, so a burst of typing fires a single request once
+        # the user pauses for _auto_delay seconds.
+        if self.setting("AutoComplete") == "false":
             return
         if ch in self.trigger_chars or ch.isalnum() or ch == "_":
             self._completion_due = time.time() + self._auto_delay
@@ -1751,6 +2355,11 @@ class LanguageServerClient:
             prev_line = self._last_line_text
             self._last_cursor_pos = cur
             self._last_line_text = line
+            # Any caret movement can take us into or out of a call's parentheses
+            # (and non-char keys such as backspace/arrows only surface here), so
+            # re-evaluate the args box on the next tick.
+            if cur != prev:
+                self._sig_dirty = True
             # Keep the popup tied to the word being edited; react to how the
             # cursor moved (only while something completion-related is live). The
             # key distinction is an *edit* (the line's text changed) versus a pure
@@ -1805,6 +2414,14 @@ class LanguageServerClient:
             # Fire any debounced diagnostic pulls (pull-diagnostics clients only).
             if self._ready():
                 self._flush_diag_pulls(now)
+            # Re-check the args box once per input event, before the completion
+            # branch below - that one returns early.
+            if self._sig_dirty:
+                self._sig_dirty = False
+                self._refresh_signature_help(now)
+            if self._ready() and self._sig_due and now >= self._sig_due:
+                self._sig_due = 0.0
+                self._request_signature_help()
             # Completion fires as soon as it's due (not throttled).
             if (self._ready() and self._completion_due
                     and now >= self._completion_due):
@@ -1888,6 +2505,10 @@ class LanguageServerClient:
             "gotodefinition": self.goto_definition,
             "references": self.find_references,
             "findreferences": self.find_references,
+            "symbols": self.list_symbols,
+            "listsymbols": self.list_symbols,
+            "functions": self.list_functions,
+            "listfunctions": self.list_functions,
             "diagnostics": self.show_all_diagnostics,
             "showdiagnostics": self.show_all_diagnostics,
             "restart": self.restart,
@@ -1901,11 +2522,11 @@ class LanguageServerClient:
         try:
             if not text:
                 return False
-            low = text.strip().lower()
+            raw = text.strip()
             prefix = self.name.lower()
-            if not low.startswith(prefix):
+            if not raw.lower().startswith(prefix):
                 return False
-            rest = low[len(prefix):]
+            rest = raw[len(prefix):]
             # Only handle the friendly "<name> <command>" form (space/colon/dash
             # separator). A bare "<Name>_<Func>" string is one of our exported
             # functions, which 10x executes directly from the command panel - if
@@ -1913,14 +2534,29 @@ class LanguageServerClient:
             # find-references output).
             if rest and rest[0] not in " :-":
                 return False
-            cmd = rest.lstrip(" :_-").replace(" ", "").replace("_", "")
-            fn = self._command_table().get(cmd)
-            if fn is None:
+            # Longest match wins, so multi-word commands ("list symbols") still
+            # resolve and anything left over is an argument: "<Name> symbols
+            # Widget" searches for "Widget". The argument keeps its original
+            # case - it's a search term, not a command name.
+            tokens = rest.lstrip(" :_-").split()
+            fn, arg = None, ""
+            for i in range(len(tokens), 0, -1):
+                fn = self._command_table().get(
+                    "".join(tokens[:i]).lower().replace("_", ""))
+                if fn is not None:
+                    arg = " ".join(tokens[i:])
+                    break
+            # Only the project-wide symbol search takes an argument; trailing
+            # text on anything else is a typo, not a command we know.
+            if fn is None or (arg and fn != self.list_symbols):
                 self.log(f"unknown command '{text}'. Try: {self.name} status | "
                          f"complete | hover | signature | definition | references | "
-                         f"diagnostics | restart")
+                         f"functions | symbols [text] | diagnostics | restart")
                 return True
-            fn()
+            if arg:
+                fn(arg)
+            else:
+                fn()
             return True
         except Exception as e:
             self.log(f"command panel error: {e}")
@@ -1942,6 +2578,8 @@ class LanguageServerClient:
             "autocomplete": self.complete,
             "showfunctionargsinfo": self.signature_help,
             "showsymbolinfo": self.hover,
+            "findfunction": self.list_functions,
+            "findsymbol": self.list_symbols,
         }
         # Comment commands only when commenting is enabled (a token is
         # configured and "<name>.Commenting" isn't off); otherwise leave 10x's
