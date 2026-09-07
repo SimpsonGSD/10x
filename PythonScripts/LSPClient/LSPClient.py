@@ -62,6 +62,14 @@
 #     <name>.MaxResults     Max completion items to show, most-relevant first
 #                           (default 50). Useful for servers like rust-analyzer
 #                           that return the whole scope.
+#     <name>.FuzzyComplete  "true"/"false" - match completion items on a
+#                           subsequence of what you've typed rather than a
+#                           literal prefix, so "gcp" finds "GetCursorPos" and
+#                           "updcur" finds "UpdateCursorMode" (default true;
+#                           set "false" for prefix matching only).
+#                           Matches rank best-first: prefix beats word-boundary
+#                           (camelCase / "_") beats mid-word, and runs of
+#                           adjacent characters beat scattered ones.
 #     <name>.LogVerbose     "true"/"false" - log server traffic to the output
 #                           panel (default false)
 #
@@ -304,6 +312,43 @@ def first_location(result):
     if isinstance(result, list) and result:
         return first_location(result[0])
     return None
+
+
+_WORD_SEPARATORS = "_-./\\:<>(),&*[]"
+
+
+def _is_word_start(text, i):
+    """True when text[i] begins a word - the string's start, after a separator,
+    or the upper/digit that starts a camelCase hump."""
+    if i == 0:
+        return True
+    prev, cur = text[i - 1], text[i]
+    if prev in _WORD_SEPARATORS:
+        return True
+    return ((cur.isupper() and not prev.isupper())
+            or (cur.isdigit() and not prev.isdigit()))
+
+
+def fuzzy_score(candidate, word):
+    """Score `word` as a subsequence of `candidate` (case-insensitive), or None
+    when the characters don't all appear in order. Lower is better.
+
+    A matched character is free when it directly follows the previous match (so
+    runs of adjacent characters stay cheap), costs 1 at a word start and 3
+    mid-word. That is what makes "gcp" rank "GetCursorPos" above
+    "GetTypeCompletionPath", and any prefix match score 0. Where the match ends
+    and how long the candidate is only break ties."""
+    low = candidate.lower()
+    score, i, prev = 0, 0, -1
+    for ch in word:
+        i = low.find(ch, i)
+        if i < 0:
+            return None
+        if i != prev + 1:
+            score += 1 if _is_word_start(candidate, i) else 3
+        prev = i
+        i += 1
+    return (score, prev, len(candidate))
 
 
 def offset_to_pos(text, offset):
@@ -1459,22 +1504,41 @@ class LanguageServerClient:
         # servers (ols, rust-analyzer) return the whole member/scope set after a
         # "." and expect the client to filter as the user types. Match against
         # filterText (the field intended for this) when present, else the label.
+        fuzzy = self._fuzzy_complete()
+        ranked = False
         if word:
             def _match(it):
-                return (it.get("filterText") or it.get("label") or "").lower()
-            items = [it for it in items if _match(it).startswith(word)]
+                return it.get("filterText") or it.get("label") or ""
+            if fuzzy:
+                # Subsequence match ("gcp" -> "GetCursorPos"), ordered by how
+                # well each item matches: a scattered hit shouldn't outrank a
+                # prefix hit just because the server ranked it higher.
+                scored = []
+                for it in items:
+                    s = fuzzy_score(_match(it), word)
+                    if s is not None:
+                        scored.append((s, it.get("sortText") or "",
+                                       it.get("label") or "", it))
+                scored.sort(key=lambda e: e[:3])
+                items = [e[3] for e in scored]
+                ranked = True
+            else:
+                items = [it for it in items
+                         if _match(it).lower().startswith(word)]
         # Order by the server's relevance ranking (sortText) so the closest
         # match - e.g. "found" - sits at the top; label breaks ties stably.
-        items = sorted(items, key=lambda it: (it.get("sortText") is None,
-                                              it.get("sortText") or "",
-                                              it.get("label") or ""))
+        if not ranked:
+            items = sorted(items, key=lambda it: (it.get("sortText") is None,
+                                                  it.get("sortText") or "",
+                                                  it.get("label") or ""))
         limit = self._max_results()
         if self._verbose():
             try:
                 x, y = N10X.Editor.GetCursorPos()
             except Exception:
                 x, y = ("?", "?")
-            self.log(f"completion: {len(items)} items after filter (cap {limit}); "
+            self.log(f"completion: {len(items)} items after "
+                     f"{'fuzzy ' if fuzzy else ''}filter (cap {limit}); "
                      f"cursor=({x},{y}) word={word!r} line_prefix={prefix!r}")
         labels, seen = [], set()
         for it in items:
@@ -1501,6 +1565,12 @@ class LanguageServerClient:
             return max(1, int(self.setting("MaxResults", "50")))
         except (TypeError, ValueError):
             return 50
+
+    def _fuzzy_complete(self):
+        """Whether to match completion items on a subsequence of the typed word
+        instead of a literal prefix (default true; "<name>.FuzzyComplete").
+        Set "false" for literal prefix matching only."""
+        return self.setting("FuzzyComplete", "true").strip().lower() != "false"
 
     def _line_prefix(self):
         """Text on the current line to the left of the cursor."""

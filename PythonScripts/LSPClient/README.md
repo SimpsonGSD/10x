@@ -41,7 +41,8 @@ when their `Enabled` setting is `true`.
 ## Features
 
 - **Completion** - manual (keybinding) and auto-trigger as you type (debounced),
-  filtered to what you've typed and capped at `MaxResults`.
+  filtered to what you've typed (fuzzy subsequence by default, see
+  `FuzzyComplete`) and capped at `MaxResults`.
 - **Hover** - documentation for the symbol under the cursor, shown in 10x's
   inline hover box.
 - **Signature help ("function args info")** - shown in 10x's function-args box
@@ -103,6 +104,7 @@ the client you're configuring (`PythonLSP`, `RustLSP`, `OdinLSP`, `JaiLSP`,
 | `<name>.Diagnostics`        | `true` / `false`                | `true`             | Show the diagnostic under the cursor in the status bar and publish diagnostics to the build-output panel. |
 | `<name>.DiagnosticsLevel`   | `error` / `warning` / `info` / `hint` | `error`      | Lowest severity to show. `error` = errors only; `warning` = errors + warnings; `hint` = everything. Applies to the status bar and build output. |
 | `<name>.MaxResults`         | integer                         | `50`               | Max completion items to show, most-relevant first. Useful for servers like rust-analyzer that return the whole scope. |
+| `<name>.FuzzyComplete`      | `true` / `false`                | `true`             | Match completion items on a *subsequence* of what you've typed rather than a literal prefix, so `gcp` finds `GetCursorPos` and `updcur` finds `UpdateCursorMode`. Matches are ranked best-first: a prefix beats a word-boundary hit (camelCase hump or after `_`), which beats a mid-word hit, and runs of adjacent characters beat scattered ones. Set `false` for literal prefix matching only. |
 | `<name>.MaxFileSize`        | integer (KB)                    | `0` (unlimited)    | Skip files larger than this: they are never sent to the server, so neither side holds their text and language features are off for them. Aimed at huge generated files. |
 | `<name>.IgnoreDirs`         | comma/semicolon list            | *(none)*           | Extra directory **names** (matched at any depth) to skip in the workspace file-watch scan, on top of the built-in list. E.g. `Generated, ThirdParty`. |
 | `<name>.ServerEnv`          | `KEY=VALUE; KEY2=VALUE2`        | *(none)*           | Environment variables for the server process, merged over the editor's environment. Mainly for tuning servers that run on a VM - see [memory use](#memory-use). |
