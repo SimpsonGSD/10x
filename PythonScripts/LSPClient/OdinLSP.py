@@ -68,6 +68,7 @@
 #   Control K, Control U: OdinLSP_UncommentLine()   (10x default)
 #   (no binding needed)  OdinLSP_ListFunctions()   (functions in this file)
 #   (no binding needed)  OdinLSP_ListSymbols()     (project-wide symbol search)
+#   (no binding needed)  OdinLSP_RefreshSymbols()  (re-read the project's symbols)
 #   (no binding needed)  OdinLSP_ShowDiagnostics()
 #   (no binding needed)  OdinLSP_Restart()
 # ---------------------------------------------------------------------------
@@ -105,6 +106,11 @@ _client = LanguageServerClient(
     root_markers=("ols.json", "ols.json5"),
     # Skip OLS's on-disk cache in the file-watch scan.
     ignore_dirs=(".ols-cache",),
+    # OLS's workspace/symbol index leaves out the workspace root package and
+    # caps results at 100, so a single-package project gets nothing from it.
+    # documentSymbol has neither limit, so build the find-symbol list from a
+    # per-file scan instead. Override with "OdinLSP.SymbolSource: auto".
+    symbol_source="documents",
 )
 
 
@@ -136,6 +142,10 @@ def OdinLSP_ListSymbols():
 
 def OdinLSP_ListFunctions():
     _client.list_functions()
+
+
+def OdinLSP_RefreshSymbols():
+    _client.refresh_symbols()
 
 
 def OdinLSP_ShowDiagnostics():

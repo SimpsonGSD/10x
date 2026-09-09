@@ -67,6 +67,7 @@
 #   Control K, Control U: JaiLSP_UncommentLine()   (10x default)
 #   (no binding needed)  JaiLSP_ListFunctions()   (functions in this file)
 #   (no binding needed)  JaiLSP_ListSymbols()     (project-wide symbol search)
+#   (no binding needed)  JaiLSP_RefreshSymbols()  (re-read the project's symbols)
 #   (no binding needed)  JaiLSP_ShowDiagnostics()
 #   (no binding needed)  JaiLSP_Restart()
 # ---------------------------------------------------------------------------
@@ -104,6 +105,10 @@ _client = LanguageServerClient(
     # prefer that, then fall back to common Jai build files. (".git" is left out
     # so a git submodule's own .git doesn't get picked as the root.)
     root_markers=("jails.json", "first.jai", "build.jai", "main.jai"),
+    # SymbolSource is left at "auto": jails answers workspace/symbol for a term
+    # but returns null for the empty query, so find-symbol falls back to the
+    # documentSymbol scan. That scan sees whatever is in the program jails is
+    # analysing - files outside it (a separate build's sources) report nothing.
 )
 
 
@@ -135,6 +140,10 @@ def JaiLSP_ListSymbols():
 
 def JaiLSP_ListFunctions():
     _client.list_functions()
+
+
+def JaiLSP_RefreshSymbols():
+    _client.refresh_symbols()
 
 
 def JaiLSP_ShowDiagnostics():
